@@ -1,126 +1,135 @@
-// ECH-Workers - KV-less Admin Panel + Login
-// ---------------------------------------
-// 本版本完全不依赖 KV：
-// - 管理密码从环境变量 ADMIN_PASSWORD 读取（或代码里默认值）
-// - 会话使用 HMAC 签名的无状态 Cookie（无需存储 Session）
-// - 配置数据全部保存在浏览器 localStorage / URL 中，Worker 不写入任何存储
-//
-// 使用方法：
-// 1. 在 Cloudflare Worker 的环境变量中设置：
-//      ADMIN_PASSWORD  登录密码（必填，建议随机复杂一点）
-//      SESSION_SECRET  会话签名密钥（必填，建议随机 32+ 字符）
-// 2. 访问 /login 登录，成功后即可进入面板。
-// 3. 面板里的所有配置都只保存在浏览器本地/localStorage，你可以导出为 URL 备份。
+// ECH-Workers V3+V4: 静态前端 + Worker API + ECH 批量节点生成（无 KV）
+// -----------------------------------------------------------------
+// 特点：
+// 1. 不依赖 KV / 数据库存储，所有配置通过 URL / 前端 localStorage 保存。
+// 2. Worker 负责：
+//    - 返回前端页面（纯静态 HTML/JS）
+//    - 提供 /sub 接口，根据 cfg 参数生成订阅（支持 IP 落地 / 多域名 / 备注前缀）。
+// 3. 前端页面负责：
+//    - 输入 UUID / 域名列表 / IP 列表 / WS 路径 / 端口 / 备注前缀
+//    - 本地生成节点列表，也可以生成 Worker 订阅链接。
 
-const encoder = new TextEncoder();
-
-// 生成 HMAC-SHA256 签名（base64url）
-async function hmacSign(secret, data) {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-  const sigBuf = await crypto.subtle.sign("HMAC", key, encoder.encode(data));
-  const bytes = new Uint8Array(sigBuf);
-  let binary = "";
-  for (let b of bytes) binary += String.fromCharCode(b);
-  const b64 = btoa(binary)
+/**
+ * 工具函数：base64url 编解码
+ */
+function b64encode(str) {
+  return btoa(unescape(encodeURIComponent(str)))
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/g, "");
-  return b64;
 }
 
-async function hmacVerify(secret, data, sig) {
-  const expected = await hmacSign(secret, data);
-  // 固定时间比较，避免侧信道（简单实现）
-  if (expected.length !== sig.length) return false;
-  let ok = 0;
-  for (let i = 0; i < expected.length; i++) {
-    ok |= expected.charCodeAt(i) ^ sig.charCodeAt(i);
-  }
-  return ok === 0;
+function b64decode(str) {
+  str = str.replace(/-/g, "+").replace(/_/g, "/");
+  while (str.length % 4) str += "=";
+  return decodeURIComponent(escape(atob(str)));
 }
 
-function parseCookies(header) {
-  const out = {};
-  if (!header) return out;
-  const parts = header.split(";");
-  for (let p of parts) {
-    const idx = p.indexOf("=");
-    if (idx === -1) continue;
-    const k = p.slice(0, idx).trim();
-    const v = p.slice(idx + 1).trim();
-    out[k] = v;
-  }
-  return out;
-}
-
-function redirect(location, extraHeaders = {}) {
-  return new Response("", {
-    status: 302,
-    headers: {
-      Location: location,
-      ...extraHeaders,
-    },
+/**
+ * 生成单个 VLESS+TLS+WS 节点 URL
+ * addr: 实际连接的地址（可为 IP 或域名）
+ * host: TLS SNI / Host 头（一般为 CDN 域名）
+ */
+function buildVlessNode({ uuid, addr, port, host, path, remark }) {
+  const p = new URLSearchParams({
+    encryption: "none",
+    security: "tls",
+    type: "ws",
+    host,
+    sni: host,
+    path,
   });
+  return `vless://${uuid}@${addr}:${port}?${p.toString()}#${encodeURIComponent(
+    remark
+  )}`;
 }
 
-// 渲染登录页
-function renderLoginPage(message = "") {
-  return `<!DOCTYPE html>
+/**
+ * 根据配置 JSON 批量生成节点列表
+ * cfg 结构示例：
+ * {
+ *   "uuid": "...",
+ *   "port": 443,
+ *   "wsPath": "/echws",
+ *   "hosts": ["ech1.example.com", "ech2.example.com"],
+ *   "ips": ["1.1.1.1", "1.0.0.1"], // 可为空
+ *   "remarkPrefix": "ECH"
+ * }
+ */
+function generateNodesFromConfig(cfg) {
+  const nodes = [];
+  const uuid = (cfg.uuid || "").trim();
+  if (!uuid) return nodes;
+  const port = cfg.port || 443;
+  const wsPath = cfg.wsPath || "/echws";
+  const hosts = Array.isArray(cfg.hosts) ? cfg.hosts : [];
+  const ips = Array.isArray(cfg.ips) ? cfg.ips : [];
+  const prefix = cfg.remarkPrefix || "ECH";
+
+  for (const host of hosts) {
+    const h = (host || "").trim();
+    if (!h) continue;
+    if (ips.length === 0) {
+      // 只有域名：addr = host
+      const remark = `${prefix}-${h}`;
+      nodes.push(
+        buildVlessNode({
+          uuid,
+          addr: h,
+          port,
+          host: h,
+          path: wsPath,
+          remark,
+        })
+      );
+    } else {
+      // 有 IP 列表：对每个 IP 生成一条，SNI/Host 仍为域名
+      for (const ip of ips) {
+        const ipAddr = (ip || "").trim();
+        if (!ipAddr) continue;
+        const remark = `${prefix}-${h}-${ipAddr}`;
+        nodes.push(
+          buildVlessNode({
+            uuid,
+            addr: ipAddr,
+            port,
+            host: h,
+            path: wsPath,
+            remark,
+          })
+        );
+      }
+    }
+  }
+
+  return nodes;
+}
+
+/**
+ * 解析 /sub?cfg=xxx 的 cfg 参数
+ */
+function parseConfigFromRequest(url) {
+  const cfgParam = url.searchParams.get("cfg");
+  if (!cfgParam) return null;
+  try {
+    const jsonStr = b64decode(cfgParam);
+    const cfg = JSON.parse(jsonStr);
+    return cfg;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * 主页 HTML：纯前端静态单页，使用 localStorage 保存配置
+ */
+function renderIndexHtml() {
+  const html = String.raw;
+  return html`<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<title>ECH-Workers 登录</title>
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<style>
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui;
-background:#030712;color:#e5e7eb;display:flex;align-items:center;
-justify-content:center;height:100vh;margin:0}
-.card{background:#020617;border:1px solid #1f2937;border-radius:16px;
-padding:32px 28px;box-shadow:0 24px 60px rgba(15,23,42,.9);width:320px}
-h1{margin:0 0 12px;font-size:20px;font-weight:600;}
-label{display:block;font-size:13px;margin-bottom:6px;color:#9ca3af}
-input[type=password]{width:100%;padding:10px 12px;border-radius:10px;
-border:1px solid #374151;background:#020617;color:#e5e7eb;box-sizing:border-box;
-outline:none;font-size:14px}
-input[type=password]:focus{border-color:#38bdf8;}
-button{margin-top:14px;width:100%;padding:10px 12px;border-radius:999px;
-border:none;font-size:14px;font-weight:500;background:linear-gradient(90deg,#06b6d4,#3b82f6);
-color:white;cursor:pointer}
-button:hover{filter:brightness(1.08);}
-.msg{min-height:20px;font-size:12px;color:#f97316;margin-bottom:8px}
-.footer{margin-top:20px;font-size:11px;color:#6b7280;text-align:center}
-</style>
-</head>
-<body>
-  <div class="card">
-    <h1>ECH-Workers 登录</h1>
-    <form method="POST" action="/login">
-      <div class="msg">${message ? message : ""}</div>
-      <label for="pwd">管理密码</label>
-      <input id="pwd" name="password" type="password" autocomplete="current-password" required />
-      <button type="submit">登录</button>
-    </form>
-    <div class="footer">
-      无 KV 版本 · 配置仅保存在浏览器本地<br/>
-    </div>
-  </div>
-</body>
-</html>`;
-}
-
-// 管理面板 HTML（配置全部在前端 localStorage / URL 中）
-function renderAdminApp() {
-  return `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8" />
-<title>ECH-Workers 面板 (No-KV)</title>
+<title>ECH-Workers 工具面板 V3+V4（静态前端 + API + 批量 ECH 节点）</title>
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <style>
 :root{
@@ -134,308 +143,390 @@ function renderAdminApp() {
   --muted:#9ca3af;
 }
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",system-ui;
-background:radial-gradient(circle at top,#1d283a 0,#020617 55%,#020617 100%);
-color:var(--text);min-height:100vh;padding:24px;}
-.card{background:rgba(15,23,42,.9);border:1px solid rgba(55,65,81,.85);
-border-radius:24px;padding:22px 22px 18px;max-width:930px;margin:0 auto;
-backdrop-filter:blur(22px);box-shadow:0 24px 80px rgba(15,23,42,.95);}
-h1{font-size:22px;font-weight:600;display:flex;align-items:center;gap:8px;
-margin-bottom:4px;}
-.badge{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid #4b5563;
-color:#9ca3af}
-p.desc{font-size:13px;color:#9ca3af;margin-bottom:18px;}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;}
-.field{display:flex;flex-direction:column;gap:4px;font-size:13px;}
-label{color:#9ca3af;font-size:12px;}
-input,select,textarea{
-  background:#020617;border-radius:12px;border:1px solid #374151;
-  padding:8px 10px;font-size:13px;color:#e5e7eb;outline:none;
+body{
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",system-ui;
+  background:radial-gradient(circle at top,#0f172a 0,#020617 55%,#020617 100%);
+  color:var(--text);
+  min-height:100vh;
+  padding:18px;
 }
-input:focus,select:focus,textarea:focus{border-color:var(--accent);}
-textarea{min-height:90px;resize:vertical;}
-.row{display:flex;flex-wrap:wrap;gap:10px;margin-top:18px;align-items:center;}
-button.btn{border:none;border-radius:999px;padding:7px 14px;font-size:12px;
-display:inline-flex;align-items:center;gap:6px;cursor:pointer;
-background:linear-gradient(90deg,#0ea5e9,#3b82f6);color:white;}
-button.btn.secondary{background:#020617;border:1px solid #374151;color:#e5e7eb;}
-.small{font-size:11px;color:#6b7280;}
-pre.out{margin-top:10px;background:#020617;border-radius:12px;border:1px dashed #334155;
-padding:8px 10px;font-size:11px;white-space:pre-wrap;word-break:break-all;
-max-height:160px;overflow:auto;}
-.tag{display:inline-flex;align-items:center;gap:4px;font-size:11px;
-padding:2px 8px;border-radius:999px;background:#020617;border:1px solid #334155;
-color:#9ca3af;}
+.container{
+  max-width:980px;
+  margin:0 auto;
+}
+.card{
+  background:rgba(15,23,42,.96);
+  border-radius:24px;
+  border:1px solid rgba(55,65,81,.85);
+  box-shadow:0 24px 80px rgba(15,23,42,.95);
+  padding:20px 20px 18px;
+  backdrop-filter:blur(22px);
+}
+h1{
+  font-size:22px;
+  font-weight:600;
+  display:flex;
+  align-items:center;
+  gap:10px;
+  margin-bottom:4px;
+}
+.badge{
+  font-size:11px;
+  padding:2px 8px;
+  border-radius:999px;
+  border:1px solid #4b5563;
+  color:#9ca3af;
+}
+.subtitle{
+  font-size:13px;
+  color:#9ca3af;
+  margin-bottom:14px;
+}
+.grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(210px,1fr));
+  gap:12px;
+}
+.field{
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+  font-size:13px;
+}
+label{
+  color:#9ca3af;
+  font-size:12px;
+}
+input,textarea{
+  background:#020617;
+  border-radius:12px;
+  border:1px solid #374151;
+  padding:8px 10px;
+  font-size:13px;
+  color:#e5e7eb;
+  outline:none;
+}
+input:focus,textarea:focus{
+  border-color:var(--accent);
+}
+textarea{
+  min-height:90px;
+  resize:vertical;
+}
+.row{
+  display:flex;
+  flex-wrap:wrap;
+  gap:10px;
+  margin-top:14px;
+  align-items:center;
+}
+.btn{
+  border:none;
+  border-radius:999px;
+  padding:7px 14px;
+  font-size:12px;
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  cursor:pointer;
+}
+.btn.primary{
+  background:linear-gradient(90deg,#0ea5e9,#3b82f6);
+  color:white;
+}
+.btn.secondary{
+  background:#020617;
+  color:#e5e7eb;
+  border:1px solid #374151;
+}
+small{
+  font-size:11px;
+  color:#6b7280;
+}
+pre.out{
+  margin-top:10px;
+  background:#020617;
+  border-radius:12px;
+  border:1px dashed #334155;
+  padding:8px 10px;
+  font-size:11px;
+  white-space:pre-wrap;
+  word-break:break-all;
+  max-height:220px;
+  overflow:auto;
+}
+code{
+  font-family:ui-monospace,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;
+  font-size:11px;
+}
+.section-title{
+  margin-top:16px;
+  margin-bottom:6px;
+  font-size:14px;
+  font-weight:500;
+}
+.tag{
+  display:inline-flex;
+  align-items:center;
+  gap:4px;
+  font-size:11px;
+  padding:2px 8px;
+  border-radius:999px;
+  border:1px solid #334155;
+  color:#9ca3af;
+}
 </style>
 </head>
 <body>
-<div class="card">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-    <div>
-      <h1>ECH-Workers 面板 <span class="badge">No KV · Local Only</span></h1>
-      <p class="desc">所有配置仅保存在浏览器 localStorage 中，可导出为 URL 进行备份或在其他设备导入。</p>
+<div class="container">
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
+      <div>
+        <h1>ECH-Workers 工具面板 V3+V4 <span class="badge">静态前端 + Worker API + 批量 ECH 节点</span></h1>
+        <div class="subtitle">
+          前端纯静态、配置保存在浏览器 localStorage；Worker 提供 /sub 接口，用于批量生成 VLESS+ECH 节点订阅。
+        </div>
+      </div>
+      <div style="text-align:right;font-size:11px;color:#9ca3af;min-width:170px;">
+        <div>前端完全无状态，无 KV 读写。</div>
+        <div style="margin-top:4px;">可通过 <code>?cfg=</code> URL 参数分享配置。</div>
+      </div>
     </div>
-    <div style="text-align:right;font-size:11px;color:#9ca3af;">
-      <div><span class="tag">已登录</span></div>
-      <div style="margin-top:6px;"><a href="/logout" style="color:#f97316;text-decoration:none;">退出登录</a></div>
-    </div>
-  </div>
 
-  <div class="grid">
-    <div class="field">
-      <label>UUID（必填）</label>
-      <input id="uuid" placeholder="例如：d50b4326-41b4-455b-899f-9452690286fe" />
+    <div class="grid">
+      <div class="field">
+        <label>UUID（必填）</label>
+        <input id="uuid" placeholder="例如：d50b4326-41b4-455b-899f-9452690286fe" />
+      </div>
+      <div class="field">
+        <label>端口（一般 443）</label>
+        <input id="port" placeholder="443" />
+      </div>
+      <div class="field">
+        <label>WS 路径（例如 /echws）</label>
+        <input id="wsPath" placeholder="/echws" />
+      </div>
+      <div class="field">
+        <label>备注前缀（用于节点名称）</label>
+        <input id="remarkPrefix" placeholder="例如：ECH" />
+      </div>
     </div>
-    <div class="field">
-      <label>Worker 域名（必填）</label>
-      <input id="workerHost" placeholder="例如：ech.example.com" />
-    </div>
-    <div class="field">
-      <label>WS 路径（必填）</label>
-      <input id="wsPath" placeholder="/echws" />
-    </div>
-    <div class="field">
-      <label>后端 VPS 域名（必填）</label>
-      <input id="backendHost" placeholder="例如：cc1.example.com" />
-    </div>
-    <div class="field">
-      <label>后端端口（必填）</label>
-      <input id="backendPort" placeholder="2082" />
-    </div>
-  </div>
 
-  <div class="row">
-    <button class="btn" id="saveBtn">保存到浏览器</button>
-    <button class="btn secondary" id="exportBtn">导出配置为 URL</button>
-    <button class="btn secondary" id="importBtn">从 URL 导入配置</button>
-    <span class="small">配置保存在当前浏览器 localStorage：<code>ech_workers_config</code></span>
-  </div>
-
-  <div style="margin-top:18px;">
-    <div style="display:flex;justify-content:space-between;align-items:center;">
-      <div class="small">生成的 VLESS 节点（可复制到 v2rayN / Clash / Sing-box）：</div>
-      <button class="btn secondary" id="genBtn">生成节点</button>
+    <div class="section-title">域名与 IP 列表</div>
+    <div class="grid">
+      <div class="field">
+        <label>CDN / Worker 域名列表（每行一个）</label>
+        <textarea id="hosts" placeholder="例如：
+ech1.example.com
+ech2.example.com"></textarea>
+      </div>
+      <div class="field">
+        <label>落地 IP 列表（可选，每行一个）</label>
+        <textarea id="ips" placeholder="例如：
+1.1.1.1
+1.0.0.1"></textarea>
+        <small>若填写 IP，则节点会以 “IP 连接 + 域名 SNI” 的 ECH 模式生成。</small>
+      </div>
     </div>
-    <pre class="out" id="outBox">// 在上方填写配置后点击“生成节点”</pre>
+
+    <div class="row">
+      <button class="btn primary" id="saveBtn">保存配置到浏览器</button>
+      <button class="btn secondary" id="loadBtn">从浏览器加载配置</button>
+      <button class="btn secondary" id="clearBtn">清空本地配置</button>
+      <small>本地存储键名：<code>ech_workers_v3v4_cfg</code></small>
+    </div>
+
+    <div class="section-title">生成节点 / 订阅</div>
+    <div class="row">
+      <button class="btn primary" id="genNodesBtn">本地生成 VLESS 节点列表</button>
+      <button class="btn secondary" id="genSubUrlBtn">生成 Worker 订阅链接（/sub?cfg=）</button>
+      <small>订阅接口为当前域名下的 <code>/sub?cfg=...</code></small>
+    </div>
+
+    <pre class="out" id="output">// 在上方填好配置后，点击“本地生成 VLESS 节点列表”</pre>
+
+    <div class="section-title">小提示</div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px;">
+      <span class="tag">1. 批量 ECH：一个域名 × 多个 IP → 多节点</span>
+      <span class="tag">2. 多落地：多个域名 × 多个 IP 交叉生成</span>
+      <span class="tag">3. 订阅链接可分享给其他客户端直接使用</span>
+    </div>
   </div>
 </div>
-
 <script>
-const STORAGE_KEY = "ech_workers_config";
+const STORAGE_KEY = "ech_workers_v3v4_cfg";
 
-function loadConfig() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return;
-    const cfg = JSON.parse(raw);
-    for (const k of ["uuid","workerHost","wsPath","backendHost","backendPort"]) {
-      if (cfg[k]) document.getElementById(k).value = cfg[k];
-    }
-  } catch (e) { console.error(e); }
-}
-
-function saveConfig() {
-  const cfg = {
-    uuid: document.getElementById("uuid").value.trim(),
-    workerHost: document.getElementById("workerHost").value.trim(),
-    wsPath: document.getElementById("wsPath").value.trim(),
-    backendHost: document.getElementById("backendHost").value.trim(),
-    backendPort: document.getElementById("backendPort").value.trim(),
-  };
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
-  alert("已保存到当前浏览器。");
-}
-
-function encodeConfigToURL() {
-  const raw = localStorage.getItem(STORAGE_KEY);
-  if (!raw) { alert("请先填写并保存配置。"); return; }
-  const b64 = btoa(unescape(encodeURIComponent(raw)));
-  const url = location.origin + "/?cfg=" + b64;
-  navigator.clipboard.writeText(url).then(()=>{
-    alert("已复制配置 URL，可在其他设备打开此链接导入。");
-  },()=>{ alert("复制失败，请手动复制:\\n" + url); });
-}
-
-function tryImportConfigFromURL() {
-  const params = new URLSearchParams(location.search);
-  const cfgParam = params.get("cfg");
-  if (!cfgParam) return;
-  try {
-    const json = decodeURIComponent(escape(atob(cfgParam)));
-    localStorage.setItem(STORAGE_KEY, json);
-  } catch (e) { console.error("导入配置失败", e); }
-}
-
-function genNode() {
+function readForm() {
   const uuid = document.getElementById("uuid").value.trim();
-  const host = document.getElementById("workerHost").value.trim();
-  const path = document.getElementById("wsPath").value.trim() || "/echws";
-  if (!uuid || !host) {
-    alert("UUID 和 Worker 域名为必填项。");
+  const portStr = document.getElementById("port").value.trim();
+  const port = portStr ? parseInt(portStr,10) : 443;
+  const wsPath = document.getElementById("wsPath").value.trim() || "/echws";
+  const remarkPrefix = document.getElementById("remarkPrefix").value.trim() || "ECH";
+  const hostsRaw = document.getElementById("hosts").value;
+  const ipsRaw = document.getElementById("ips").value;
+  const hosts = hostsRaw.split(/[\r\n]+/).map(s=>s.trim()).filter(Boolean);
+  const ips = ipsRaw.split(/[\r\n]+/).map(s=>s.trim()).filter(Boolean);
+  return { uuid, port, wsPath, remarkPrefix, hosts, ips };
+}
+
+function writeForm(cfg) {
+  document.getElementById("uuid").value = cfg.uuid || "";
+  document.getElementById("port").value = cfg.port || "";
+  document.getElementById("wsPath").value = cfg.wsPath || "";
+  document.getElementById("remarkPrefix").value = cfg.remarkPrefix || "";
+  document.getElementById("hosts").value = (cfg.hosts || []).join("\\n");
+  document.getElementById("ips").value = (cfg.ips || []).join("\\n");
+}
+
+function saveToLocal() {
+  const cfg = readForm();
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
+  alert("已保存当前配置到浏览器本地。");
+}
+
+function loadFromLocal() {
+  const raw = localStorage.getItem(STORAGE_KEY);
+  if (!raw) {
+    alert("没有已保存的配置。");
     return;
   }
-  const addr = host;
-  const port = 443;
-  const params = new URLSearchParams({
-    encryption: "none",
-    security: "tls",
-    type: "ws",
-    path: path,
-    host: host,
-    sni: host
-  });
-  const link = "vless://" + uuid + "@" + addr + ":" + port + "?" +
-    params.toString() + "#ECH-Workers";
-  document.getElementById("outBox").textContent = link;
+  try {
+    const cfg = JSON.parse(raw);
+    writeForm(cfg);
+    alert("已从浏览器加载配置。");
+  } catch(e) {
+    console.error(e);
+    alert("解析本地配置失败。");
+  }
 }
 
-document.getElementById("saveBtn").onclick = saveConfig;
-document.getElementById("exportBtn").onclick = encodeConfigToURL;
-document.getElementById("importBtn").onclick = ()=>{
-  const u = prompt("请输入包含 cfg 参数的 URL：","");
-  if (!u) return;
-  try {
-    const urlObj = new URL(u);
-    const cfgParam = urlObj.searchParams.get("cfg");
-    if (!cfgParam) throw new Error("缺少 cfg 参数");
-    const json = decodeURIComponent(escape(atob(cfgParam)));
-    localStorage.setItem(STORAGE_KEY, json);
-    loadConfig();
-    alert("已从 URL 导入配置并保存到浏览器。");
-  } catch(e) {
-    alert("解析失败：" + e.message);
-  }
-};
-document.getElementById("genBtn").onclick = genNode;
+function clearLocal() {
+  localStorage.removeItem(STORAGE_KEY);
+  alert("已清空本地配置。");
+}
 
-tryImportConfigFromURL();
-loadConfig();
+function buildNodes(cfg) {
+  const url = new URL(location.href);
+  // 在前端重用 Worker 内的算法：写一份简单版
+  function localBuildNode(uuid, addr, port, host, path, remark) {
+    const params = new URLSearchParams({
+      encryption: "none",
+      security: "tls",
+      type: "ws",
+      host,
+      sni: host,
+      path,
+    });
+    return "vless://" + uuid + "@" + addr + ":" + port + "?" + params.toString() + "#" + encodeURIComponent(remark);
+  }
+
+  const { uuid, port, wsPath, remarkPrefix, hosts, ips } = cfg;
+  const nodes = [];
+  if (!uuid) return nodes;
+  for (const h0 of hosts) {
+    const h = (h0 || "").trim();
+    if (!h) continue;
+    if (!ips.length) {
+      nodes.push(localBuildNode(uuid, h, port, h, wsPath, remarkPrefix + "-" + h));
+    } else {
+      for (const ip0 of ips) {
+        const ip = (ip0 || "").trim();
+        if (!ip) continue;
+        nodes.push(localBuildNode(uuid, ip, port, h, wsPath, remarkPrefix + "-" + h + "-" + ip));
+      }
+    }
+  }
+  return nodes;
+}
+
+function genNodes() {
+  const cfg = readForm();
+  const nodes = buildNodes(cfg);
+  if (!nodes.length) {
+    document.getElementById("output").textContent = "// 请至少填写 UUID 和一个域名。";
+    return;
+  }
+  document.getElementById("output").textContent = nodes.join("\\n");
+}
+
+function genSubUrl() {
+  const cfg = readForm();
+  const json = JSON.stringify(cfg);
+  const b64 = b64encode(json);
+  const base = location.origin.replace(/\/+$/,"");
+  const url = base + "/sub?cfg=" + b64;
+  navigator.clipboard.writeText(url).then(()=>{
+    alert("已复制订阅链接：\\n" + url);
+  },()=>{
+    alert("订阅链接：\\n" + url);
+  });
+}
+
+// 尝试从 URL 中的 cfg 参数加载配置（方便分享）
+(function initFromUrl() {
+  try {
+    const url = new URL(location.href);
+    const cfgParam = url.searchParams.get("cfg");
+    if (!cfgParam) return;
+    const jsonStr = b64decode(cfgParam);
+    const cfg = JSON.parse(jsonStr);
+    writeForm(cfg);
+  } catch(e) {
+    console.error("从 URL cfg 导入配置失败：", e);
+  }
+})();
+
+document.getElementById("saveBtn").onclick = saveToLocal;
+document.getElementById("loadBtn").onclick = loadFromLocal;
+document.getElementById("clearBtn").onclick = clearLocal;
+document.getElementById("genNodesBtn").onclick = genNodes;
+document.getElementById("genSubUrlBtn").onclick = genSubUrl;
+
+// 页面加载时尝试自动从 localStorage 恢复
+(function autoLoad() {
+  const raw = localStorage.getItem(STORAGE_KEY);
+  if (!raw) return;
+  try {
+    const cfg = JSON.parse(raw);
+    writeForm(cfg);
+  } catch(e) {}
+})();
 </script>
 </body>
 </html>`;
 }
 
-// 解析 x-www-form-urlencoded
-async function parseFormData(request) {
-  const text = await request.text();
-  const params = new URLSearchParams(text);
-  const out = {};
-  for (const [k, v] of params) out[k] = v;
-  return out;
-}
-
-// 校验 Session Cookie
-async function verifySession(env, request) {
-  const cookieHeader = request.headers.get("Cookie") || "";
-  const cookies = parseCookies(cookieHeader);
-  const token = cookies["ech_session"];
-  if (!token) return false;
-  const parts = token.split(".");
-  if (parts.length !== 2) return false;
-  const [expStr, sig] = parts;
-  const exp = parseInt(expStr, 10);
-  if (!exp || Date.now() > exp) return false;
-  const secret = env.SESSION_SECRET || "CHANGE_ME_SESSION_SECRET";
-  const ok = await hmacVerify(secret, expStr, sig);
-  return ok;
-}
-
-// 生成 Session Cookie
-async function createSessionCookie(env) {
-  const ttlMs = 24 * 60 * 60 * 1000; // 24h
-  const exp = Date.now() + ttlMs;
-  const expStr = String(exp);
-  const secret = env.SESSION_SECRET || "CHANGE_ME_SESSION_SECRET";
-  const sig = await hmacSign(secret, expStr);
-  const token = `${expStr}.${sig}`;
-  const maxAge = Math.floor(ttlMs / 1000);
-  const cookie = [
-    `ech_session=${token}`,
-    "Path=/",
-    "HttpOnly",
-    "Secure",
-    "SameSite=Lax",
-    `Max-Age=${maxAge}`
-  ].join("; ");
-  return cookie;
-}
-
-// 清空 Session Cookie
-function clearSessionCookie() {
-  const cookie = [
-    "ech_session=deleted",
-    "Path=/",
-    "HttpOnly",
-    "Secure",
-    "SameSite=Lax",
-    "Max-Age=0"
-  ].join("; ");
-  return cookie;
-}
-
-// 处理请求
+/**
+ * Worker 主入口
+ */
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    const pathname = url.pathname;
+    const { pathname } = url;
 
-    // 登录逻辑
-    if (pathname === "/login") {
-      if (request.method === "GET") {
-        const authed = await verifySession(env, request);
-        if (authed) {
-          return redirect("/");
-        }
-        return new Response(renderLoginPage(""), {
-          status: 200,
-          headers: { "content-type": "text/html; charset=utf-8" },
-        });
-      }
-
-      if (request.method === "POST") {
-        const form = await parseFormData(request);
-        const password = form.password || "";
-        const expected = env.ADMIN_PASSWORD || "CHANGE_ME_ADMIN_PASSWORD";
-        if (!password || password !== expected) {
-          return new Response(renderLoginPage("密码错误，请重试。"), {
-            status: 200,
-            headers: { "content-type": "text/html; charset=utf-8" },
-          });
-        }
-        const cookie = await createSessionCookie(env);
-        return new Response("", {
-          status: 302,
-          headers: {
-            "Location": "/",
-            "Set-Cookie": cookie,
-          },
-        });
-      }
-
-      return new Response("Method Not Allowed", { status: 405 });
-    }
-
-    // 退出登录
-    if (pathname === "/logout") {
-      const cookie = clearSessionCookie();
-      return redirect("/login", { "Set-Cookie": cookie });
-    }
-
-    // 其它路径都需要鉴权
-    const authed = await verifySession(env, request);
-    if (!authed) {
-      return redirect("/login");
-    }
-
-    // 管理面板单页应用
     if (pathname === "/" || pathname === "/index.html") {
-      return new Response(renderAdminApp(), {
+      return new Response(renderIndexHtml(), {
         status: 200,
         headers: { "content-type": "text/html; charset=utf-8" },
       });
     }
 
-    // 未知路径
-    return new Response("Not found", { status: 404 });
+    if (pathname === "/sub") {
+      const cfg = parseConfigFromRequest(url);
+      if (!cfg) {
+        return new Response("INVALID CFG", { status: 400 });
+      }
+      const nodes = generateNodesFromConfig(cfg);
+      if (!nodes.length) {
+        return new Response("NO NODES", { status: 400 });
+      }
+      const body = nodes.join("\n") + "\n";
+      return new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      });
+    }
+
+    return new Response("Not Found", { status: 404 });
   },
 };
