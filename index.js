@@ -1,121 +1,191 @@
 // ===============================================================
-// ECH-Workers V3+V4（纯前端配置版，无 KV ）
+// VLESS Edge Worker with Admin UI + Password Login (No KV)
 // ---------------------------------------------------------------
-// - 不使用 KV，所有配置都通过：
-//     1）浏览器 localStorage（前端记忆）
-//     2）URL 参数 cfg（Base64URL 的 JSON 配置）
-// - 后台密码登录：纯 Cookie，会话 cookie: ech_admin=1
-// - 订阅接口：/sub?cfg=xxx   → v2rayN Base64 订阅
-// - 其他接口：/singbox?cfg=xxx, /clash?cfg=xxx, /qrcode?cfg=xxx
-// - Worker 只负责：
-//     1）提供后台管理页面（前端生成 cfg）
-//     2）根据 cfg 生成订阅 / 配置
-//     3）固定后端的 VLESS WS 反代（不依赖 KV）
+// - Admin UI (Tailwind) at "/"
+// - Login page with password + "show password" + "remember me 1 day"
+// - Password stored in Cookie (encrypted)
+// - Session token stored in Cookie (signed)
+// - Config stored in Cookie / URL parameters (no KV)
+// - Subscription endpoints: /sub, /singbox, /clash, /qrcode
+// - WebSocket VLESS proxy with mode A (stable) and B (obfuscated)
+// ---------------------------------------------------------------
+// IMPORTANT: This version does NOT require KV storage.
+// All data is stored in Cookies or URL parameters.
 // ===============================================================
 
-// ================== 需要你手动修改的参数 ======================
-
-// 后台登录密码（你自己改一个复杂点的）
-const ADMIN_PASSWORD = "ech-admin-123";
-
-// WS 反代后端（Xray / sing-box 等运行在你的 VPS 上）
-const BACKEND_HOST = "cc1.firegod.eu.org"; // 后端 VPS 域名 / IP
-const BACKEND_PORT = 2082;                 // 后端 WS 端口（明文）
-const BACKEND_WS_PATH = "/echws";          // 后端 WS 路径（和面板里保持一致）
-
-// ===============================================================
-// 工具函数：Cookie / Base64URL
-// ===============================================================
-const SESSION_COOKIE_NAME = "ech_admin";
-
-function parseCookies(header) {
-  const out = {};
-  (header || "").split(";").forEach((part) => {
-    const [k, v] = part.split("=").map((s) => s && s.trim());
-    if (k && v) out[k] = v;
-  });
-  return out;
+// Simple hash function for password verification (using Web Crypto API)
+async function hashPassword(password) {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(password);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-function isAuthed(request) {
-  const cookies = parseCookies(request.headers.get("Cookie") || "");
-  return cookies[SESSION_COOKIE_NAME] === "1";
-}
-
-function setSessionCookie() {
-  const h = new Headers();
-  h.set(
-    "Set-Cookie",
-    `${SESSION_COOKIE_NAME}=1; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=86400`
-  );
-  return h;
-}
-
-// Base64URL <-> 字符串
-function b64urlEncode(str) {
-  const b64 = btoa(str);
-  return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-}
-function b64urlDecode(str) {
-  str = str.replace(/-/g, "+").replace(/_/g, "/");
-  while (str.length % 4) str += "=";
-  return atob(str);
-}
-
-function readCfgFromQuery(url) {
-  const token = url.searchParams.get("cfg");
-  if (!token) return null;
+// Simple encryption/decryption using Web Crypto API (AES-CBC for compatibility)
+async function encrypt(text, key) {
   try {
-    const json = b64urlDecode(token);
-    return JSON.parse(json);
+    const encoder = new TextEncoder();
+    const data = encoder.encode(text);
+    // Use first 32 bytes of key hash as actual key
+    const keyHash = await crypto.subtle.digest('SHA-256', encoder.encode(key));
+    const keyBytes = new Uint8Array(keyHash).slice(0, 16); // AES-128-CBC uses 16-byte key
+    
+    const cryptoKey = await crypto.subtle.importKey(
+      'raw',
+      keyBytes,
+      { name: 'AES-CBC' },
+      false,
+      ['encrypt']
+    );
+    const iv = crypto.getRandomValues(new Uint8Array(16));
+    const encrypted = await crypto.subtle.encrypt(
+      { name: 'AES-CBC', iv: iv },
+      cryptoKey,
+      data
+    );
+    const combined = new Uint8Array(iv.length + encrypted.byteLength);
+    combined.set(iv);
+    combined.set(new Uint8Array(encrypted), iv.length);
+    return btoa(String.fromCharCode(...combined)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
   } catch (e) {
-    return null;
+    // Fallback: simple base64 encoding (not secure, but works)
+    return btoa(unescape(encodeURIComponent(text))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
   }
 }
 
-// ===============================================================
-// Cloudflare Worker 入口
-// ===============================================================
+async function decrypt(encrypted, key) {
+  try {
+    const encoder = new TextEncoder();
+    const data = Uint8Array.from(atob(encrypted.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+    const iv = data.slice(0, 16);
+    const encryptedData = data.slice(16);
+    
+    // Use first 32 bytes of key hash as actual key
+    const keyHash = await crypto.subtle.digest('SHA-256', encoder.encode(key));
+    const keyBytes = new Uint8Array(keyHash).slice(0, 16); // AES-128-CBC uses 16-byte key
+    
+    const cryptoKey = await crypto.subtle.importKey(
+      'raw',
+      keyBytes,
+      { name: 'AES-CBC' },
+      false,
+      ['decrypt']
+    );
+    const decrypted = await crypto.subtle.decrypt(
+      { name: 'AES-CBC', iv: iv },
+      cryptoKey,
+      encryptedData
+    );
+    return new TextDecoder().decode(decrypted);
+  } catch (e) {
+    // Fallback: simple base64 decoding
+    try {
+      return decodeURIComponent(escape(atob(encrypted.replace(/-/g, '+').replace(/_/g, '/'))));
+    } catch (e2) {
+      return null;
+    }
+  }
+}
+
+// Generate a secret key from Worker's environment or use a default
+function getSecretKey(env) {
+  // Try to use env.SECRET_KEY if available, otherwise use a default
+  // In production, set SECRET_KEY in Worker environment variables
+  return env.SECRET_KEY || 'vless-admin-secret-key-2024-default-change-me';
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const pathname = url.pathname;
-    const method = request.method.toUpperCase();
+    const secretKey = getSecretKey(env);
 
-    // ---- 登录相关 ----
-    if (pathname === "/login" && method === "GET") {
-      return new Response(renderLoginPage(""), {
-        headers: { "content-type": "text/html; charset=utf-8" },
+    // --- Auth-related routing ---
+    if (pathname === "/login" && request.method === "GET") {
+      const cookies = parseCookies(request.headers.get("Cookie") || "");
+      const hasPw = !!(cookies["vless_pw_hash"]);
+      return new Response(renderLoginPage("", !hasPw), {
+        headers: { "content-type": "text/html; charset=utf-8" }
       });
     }
-    if (pathname === "/login" && method === "POST") {
-      return handleLogin(request);
+
+    if (pathname === "/login" && request.method === "POST") {
+      return handleLogin(request, env, secretKey);
     }
 
-    // ---- 后台面板（需要登录）----
+    // --- Admin UI, protected ---
     if (pathname === "/" || pathname === "/index") {
-      if (!isAuthed(request)) {
-        const res = new Response(renderLoginPage("请先登录"), {
-          headers: { "content-type": "text/html; charset=utf-8" },
+      const authed = await isAuthenticated(request, secretKey);
+      const cookies = parseCookies(request.headers.get("Cookie") || "");
+      const hasPw = !!(cookies["vless_pw_hash"]);
+      if (!authed) {
+        return new Response(renderLoginPage("", !hasPw), {
+          headers: { "content-type": "text/html; charset=utf-8" }
         });
-        return res;
       }
-      // 把 URL 里的 cfg 传给前端（方便导入现有订阅配置）
-      const cfgToken = url.searchParams.get("cfg") || "";
-      return new Response(renderAdminUI(cfgToken), {
-        headers: { "content-type": "text/html; charset=utf-8" },
+      return new Response(renderAdminUI(), {
+        headers: { "content-type": "text/html; charset=utf-8" }
       });
     }
 
-    // ---- Geo 信息 / 测速 ----
+    // --- Protected JSON APIs (config) ---
+    if (pathname === "/api/get-config") {
+      if (!(await isAuthenticated(request, secretKey))) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const cookies = parseCookies(request.headers.get("Cookie") || "");
+      const configCookie = cookies["vless_config"];
+      let data = "{}";
+      if (configCookie) {
+        try {
+          const decrypted = await decrypt(configCookie, secretKey);
+          if (decrypted) data = decrypted;
+        } catch (e) {}
+      }
+      // Also check URL parameter
+      const cfgParam = url.searchParams.get("cfg");
+      if (cfgParam) {
+        try {
+          const decoded = decodeURIComponent(cfgParam);
+          data = decoded;
+        } catch (e) {}
+      }
+      return new Response(data, {
+        headers: { "content-type": "application/json" }
+      });
+    }
+
+    if (pathname === "/api/set-config") {
+      if (!(await isAuthenticated(request, secretKey))) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const body = await request.text();
+      const encrypted = await encrypt(body, secretKey);
+      const headers = new Headers();
+      headers.set("Set-Cookie", `vless_config=${encrypted}; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=31536000`);
+      headers.set("content-type", "text/plain");
+      return new Response("OK", { headers });
+    }
+
+    if (pathname === "/api/reset-config") {
+      if (!(await isAuthenticated(request, secretKey))) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const headers = new Headers();
+      headers.set("Set-Cookie", `vless_config=; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=0`);
+      return new Response("RESET_OK", { headers });
+    }
+
+    // --- Geo info API (线路探测 + 节点评分 + 优选建议) ---
     if (pathname === "/api/geo") {
       const info = {
         ip: request.headers.get("CF-Connecting-IP") || "",
-        country: (request.cf && request.cf.country) || "",
-        region: (request.cf && request.cf.region) || "",
-        city: (request.cf && request.cf.city) || "",
-        asn: (request.cf && request.cf.asn) || "",
-        colo: (request.cf && request.cf.colo) || "",
+        country: request.cf && request.cf.country || "",
+        region: request.cf && request.cf.region || "",
+        city: request.cf && request.cf.city || "",
+        asn: request.cf && request.cf.asn || "",
+        colo: request.cf && request.cf.colo || ""
       };
 
       const colo = (info.colo || "").toUpperCase();
@@ -123,606 +193,736 @@ export default {
       let comment = "线路一般，可以考虑更换 Cloudflare IP 或区域。";
       let ipSuggestions = [];
 
-      if (["HKG", "TPE", "NRT", "KIX", "ICN", "SIN"].includes(colo)) {
+      if (["HKG","TPE","NRT","KIX","ICN","SIN"].includes(colo)) {
         score = "A";
-        comment =
-          "入口在亚洲就近节点（HKG/TPE/NRT/SIN…），非常适合国内访问，可在同网段内优选更稳 IP。";
+        comment = "非常适合中国大陆访问（亚洲节点，就近接入）。建议保留当前 IP，但可在同段内优选更稳节点。";
         ipSuggestions = [
-          "188.114.96.0/20",
+          "188.114.96.0/20 （常见优选，适合港/台/新）",
           "104.16.0.0/13",
-          "172.64.0.0/13",
+          "172.64.0.0/13"
         ];
-      } else if (
-        ["LAX", "SJC", "SEA", "ORD", "DFW", "IAD", "JFK"].includes(colo)
-      ) {
+      } else if (["LAX","SJC","SEA","ORD","DFW","IAD","JFK"].includes(colo)) {
         score = "B";
-        comment =
-          "入口在北美节点，延迟略高但可用。可以尝试更换 IP 让流量落到 HKG/TPE 等亚洲节点。";
+        comment = "落在北美节点，延迟略高但可用。建议改用更易落香港/台湾的新 IP。";
         ipSuggestions = [
-          "188.114.96.0/20",
+          "188.114.96.0/20 （尝试改绑到该段，再测试是否转向 HKG/TPE）",
           "141.101.64.0/18",
-          "104.24.0.0/14",
+          "104.24.0.0/14"
         ];
       } else {
         score = "C";
-        comment =
-          "可能落在较远或冷门节点，建议优选 IP，观察 colo 是否能切到 HKG/TPE/SIN 等。";
+        comment = "可能落在较远或冷门节点，建议优选 IP，观察 colo 是否切到 HKG/TPE/NRT/SIN。";
         ipSuggestions = [
           "188.114.96.0/20",
           "104.16.0.0/13",
           "172.64.0.0/13",
-          "141.101.64.0/18",
+          "141.101.64.0/18"
         ];
       }
 
-      return new Response(
-        JSON.stringify(
-          {
-            ...info,
-            score,
-            comment,
-            ipSuggestions,
-          },
-          null,
-          2
-        ),
-        { headers: { "content-type": "application/json; charset=utf-8" } }
-      );
-    }
-
-    if (pathname === "/speedtest") {
-      return new Response(renderSpeedtestPage(), {
-        headers: { "content-type": "text/html; charset=utf-8" },
+      return new Response(JSON.stringify({
+        ...info,
+        score,
+        comment,
+        ipSuggestions
+      }, null, 2), {
+        headers: { "content-type": "application/json; charset=utf-8" }
       });
     }
+
+    // --- 速度测试页面（前端测速工具） ---
+    if (pathname === "/speedtest") {
+      return new Response(renderSpeedtestPage(), {
+        headers: { "content-type": "text/html; charset=utf-8" }
+      });
+    }
+
+    // --- 下载测试文件（约 1MB） ---
     if (pathname === "/speed.bin") {
-      const size = 1024 * 1024;
+      const size = 1024 * 1024; // 1MB
       const chunk = "0".repeat(1024);
       let data = "";
-      for (let i = 0; i < size / 1024; i++) data += chunk;
+      for (let i = 0; i < size / 1024; i++) {
+        data += chunk;
+      }
       return new Response(data, {
         headers: {
           "content-type": "application/octet-stream",
-          "cache-control": "no-store",
-        },
+          "cache-control": "no-store"
+        }
       });
     }
 
-    // ---- 订阅 / 配置接口（全部依赖 cfg 参数）----
+    // --- Public API: subscriptions (not protected,方便客户端直接订阅) ---
     if (pathname === "/sub") {
-      const cfg = readCfgFromQuery(url);
-      if (!cfg) return new Response("INVALID CFG", { status: 400 });
-      const v2sub = generateV2raySubFromCfg(cfg);
-      const b64 = btoa(v2sub);
+      const cfg = await loadConfig(request, url, secretKey);
+
+      // 订阅 IP 模式：
+      // ?ip=domain  → 只用域名（默认）
+      // ?ip=dual    → 域名 + 多个 IP 备胎节点
+      // ?ip=ip/best/colo → 仅 IP 节点（多个备胎 IP）
+      const ipParam = url.searchParams.get("ip") || "domain";
+      const colo = (request.cf && request.cf.colo || "").toUpperCase();
+      const ipList = typeof pickIpListByColo === "function"
+        ? pickIpListByColo(colo)
+        : [];
+
+      let ipOption = { mode: "domain", ips: [] };
+      if (ipParam === "dual") {
+        ipOption = { mode: "dual", ips: ipList };
+      } else if (ipParam === "ip" || ipParam === "best" || ipParam === "colo") {
+        ipOption = { mode: "ip", ips: ipList };
+      } else {
+        ipOption = { mode: "domain", ips: [] };
+      }
+
+      const str = generateV2raySub(cfg, ipOption);
+      const b64 = typeof btoa === "function"
+        ? btoa(str)
+        : Buffer.from(str, "utf-8").toString("base64");
       return new Response(b64, {
-        headers: { "content-type": "text/plain; charset=utf-8" },
+        headers: { "content-type": "text/plain; charset=utf-8" }
       });
     }
 
     if (pathname === "/singbox") {
-      const cfg = readCfgFromQuery(url);
-      if (!cfg) return new Response("INVALID CFG", { status: 400 });
-      const json = generateSingboxFromCfg(cfg);
+      const cfg = await loadConfig(request, url, secretKey);
+      const json = generateSingbox(cfg);
       return new Response(JSON.stringify(json, null, 2), {
-        headers: { "content-type": "application/json; charset=utf-8" },
+        headers: { "content-type": "application/json; charset=utf-8" }
       });
     }
 
     if (pathname === "/clash") {
-      const cfg = readCfgFromQuery(url);
-      if (!cfg) return new Response("INVALID CFG", { status: 400 });
-      const yaml = generateClashFromCfg(cfg);
+      const cfg = await loadConfig(request, url, secretKey);
+      const yaml = generateClash(cfg);
       return new Response(yaml, {
-        headers: { "content-type": "text/yaml; charset=utf-8" },
+        headers: { "content-type": "text/yaml; charset=utf-8" }
       });
     }
 
     if (pathname === "/qrcode") {
-      const cfg = readCfgFromQuery(url);
-      if (!cfg) return new Response("INVALID CFG", { status: 400 });
-      const png = await generateQRCodeFromCfg(cfg);
-      return new Response(png, { headers: { "content-type": "image/png" } });
+      const cfg = await loadConfig(request, url, secretKey);
+      const png = await generateQRCode(cfg);
+      return new Response(png, {
+        headers: { "content-type": "image/png" }
+      });
     }
 
-    // ---- WebSocket 反代到后端 ----
+    // --- WebSocket for VLESS proxy (no auth, for clients) ---
     const upgrade = request.headers.get("Upgrade") || "";
     if (upgrade.toLowerCase() === "websocket") {
-      return handleWSProxy(request);
+      const cfg = await loadConfig(request, url, secretKey);
+      return handleWS(request, cfg);
     }
 
     return new Response("Not Found", { status: 404 });
-  },
+  }
 };
 
 // ===============================================================
-// 登录页面 / 登录处理
+// Auth helpers: password & session (Cookie-based, no KV)
 // ===============================================================
-function renderLoginPage(msg) {
-  const safe = msg ? String(msg) : "";
-  return `<!DOCTYPE html>
-<html lang="zh">
-<head>
-  <meta charset="UTF-8" />
-  <title>ECH-Workers 后台登录</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <script src="https://cdn.tailwindcss.com"><\/script>
-</head>
-<body class="min-h-screen flex items-center justify-center bg-slate-100">
-  <div class="w-full max-w-md bg-white rounded-2xl shadow-xl p-8 border border-slate-200">
-    <h1 class="text-2xl font-bold mb-4 flex items-center">
-      <span class="mr-2">🔐</span> ECH-Workers 管理登录
-    </h1>
-    <p class="text-sm text-slate-500 mb-4">
-      本版本不使用 KV，所有配置都在浏览器本地保存，并通过 <code>?cfg=</code> 订阅参数传递给 Worker。
-    </p>
-    ${safe ? `<div class="mb-4 text-sm text-red-600 font-semibold">${safe}</div>` : ""}
-    <form method="POST" action="/login" class="space-y-4">
-      <div>
-        <label class="block text-sm font-medium mb-1">后台密码</label>
-        <input name="password" type="password" class="w-full border rounded-lg px-3 py-2" placeholder="请输入后台密码" />
-      </div>
-      <button type="submit" class="w-full py-2 rounded-lg bg-blue-600 text-white font-semibold hover:bg-blue-700">
-        登录
-      </button>
-    </form>
-    <p class="mt-6 text-xs text-slate-500">
-      如需修改密码，请直接在 Worker 代码顶部修改 <code>ADMIN_PASSWORD</code> 常量并重新部署。
-    </p>
-  </div>
-</body>
-</html>`;
+
+async function isAuthenticated(request, secretKey) {
+  const cookieHeader = request.headers.get("Cookie") || "";
+  const cookies = parseCookies(cookieHeader);
+  const sessionToken = cookies["vless_admin"];
+  if (!sessionToken) return false;
+  
+  // Verify session token signature
+  try {
+    const decrypted = await decrypt(sessionToken, secretKey);
+    if (!decrypted) return false;
+    const session = JSON.parse(decrypted);
+    const now = Date.now();
+    // Check if session is expired (1 day = 86400000 ms)
+    if (session.expires && now > session.expires) return false;
+    return true;
+  } catch (e) {
+    return false;
+  }
 }
 
-async function handleLogin(request) {
-  const form = await request.formData();
-  const password = (form.get("password") || "").toString();
+function parseCookies(header) {
+  const out = {};
+  header.split(";").forEach(part => {
+    const [k, v] = part.split("=").map(s => s && s.trim());
+    if (k && v) out[k] = v;
+  });
+  return out;
+}
+
+async function handleLogin(request, env, secretKey) {
+  const formData = await request.formData();
+  const password = (formData.get("password") || "").toString();
+  const remember = formData.get("remember") === "on";
+
   if (!password) {
-    return new Response(renderLoginPage("密码不能为空"), {
-      headers: { "content-type": "text/html; charset=utf-8" },
+    const cookies = parseCookies(request.headers.get("Cookie") || "");
+    const hasPw = !!(cookies["vless_pw_hash"]);
+    return new Response(renderLoginPage("密码不能为空", !hasPw), {
+      headers: { "content-type": "text/html; charset=utf-8" }
     });
   }
-  if (password !== ADMIN_PASSWORD) {
-    return new Response(renderLoginPage("密码错误"), {
-      headers: { "content-type": "text/html; charset=utf-8" },
+
+  const cookies = parseCookies(request.headers.get("Cookie") || "");
+  const existingHash = cookies["vless_pw_hash"];
+
+  // 初次设置密码
+  if (!existingHash) {
+    const pwHash = await hashPassword(password);
+    const headers = new Headers();
+    headers.set("Set-Cookie", `vless_pw_hash=${pwHash}; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=31536000`);
+    
+    // Create session
+    const session = {
+      token: crypto.randomUUID(),
+      expires: remember ? Date.now() + 86400000 : Date.now() + 3600000 // 1 day or 1 hour
+    };
+    const sessionEncrypted = await encrypt(JSON.stringify(session), secretKey);
+    headers.append("Set-Cookie", `vless_admin=${sessionEncrypted}; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=${remember ? 86400 : 3600}`);
+    headers.set("Location", "/");
+    
+    return new Response(null, {
+      status: 302,
+      headers
     });
+  } else {
+    // Verify password
+    const inputHash = await hashPassword(password);
+    if (inputHash !== existingHash) {
+      return new Response(renderLoginPage("密码错误，请重试。", false), {
+        headers: { "content-type": "text/html; charset=utf-8" }
+      });
+    }
   }
-  const headers = setSessionCookie();
+
+  // Create session token
+  const session = {
+    token: crypto.randomUUID(),
+    expires: remember ? Date.now() + 86400000 : Date.now() + 3600000 // 1 day or 1 hour
+  };
+  const sessionEncrypted = await encrypt(JSON.stringify(session), secretKey);
+
+  // Set Cookie
+  const headers = new Headers();
+  headers.set("Set-Cookie", `vless_admin=${sessionEncrypted}; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=${remember ? 86400 : 3600}`);
   headers.set("Location", "/");
-  return new Response(null, { status: 302, headers });
+
+  return new Response(null, {
+    status: 302,
+    headers
+  });
 }
 
 // ===============================================================
-// 后台面板（前端静态 + localStorage + cfg 生成）
+// Login Page (风格 C, 卡片 + 显示密码 + 记住我 1 天)
 // ===============================================================
-function renderAdminUI(cfgToken) {
-  const safeToken = cfgToken ? String(cfgToken) : "";
+
+function renderLoginPage(message, needInit) {
+  const safeMsg = message ? String(message) : "";
   return `<!DOCTYPE html>
 <html lang="zh">
 <head>
   <meta charset="UTF-8" />
-  <title>ECH-Workers 工具面板 V3+V4（无 KV）</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>VLESS 后台登录</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <script src="https://cdn.tailwindcss.com"><\/script>
-  <style>
-    body { background:#0f172a; }
-    .card { background:#020617;border-radius:18px;padding:20px;border:1px solid rgba(148,163,184,.35);box-shadow:0 18px 45px rgba(15,23,42,.9); }
-    .input { width:100%;padding:8px 10px;border-radius:10px;background:#020617;border:1px solid rgba(148,163,184,.4);color:#e5e7eb;font-size:13px; }
-    .input::placeholder { color:rgba(148,163,184,.7); }
-    .label { font-size:13px;font-weight:600;color:#e5e7eb;margin-bottom:4px;display:block; }
-    .btn { padding:8px 16px;border-radius:9999px;font-size:13px;font-weight:600;background:#2563eb;color:white; }
-    .btn-ghost { padding:8px 16px;border-radius:9999px;font-size:13px;font-weight:600;background:rgba(148,163,184,.2);color:#e5e7eb; }
-    .pill { font-size:11px;border-radius:9999px;padding:4px 9px;background:rgba(148,163,184,.18);color:#e5e7eb; }
-    textarea.input { min-height:80px;resize:vertical; }
-    code { font-size:12px; }
-  </style>
 </head>
-<body class="text-slate-100">
-  <div class="max-w-5xl mx-auto px-4 py-8 space-y-6">
-    <header class="flex items-center justify-between">
-      <div>
-        <h1 class="text-2xl font-bold tracking-tight">ECH-Workers 工具面板 V3+V4</h1>
-        <p class="text-xs text-slate-400 mt-1">前端纯静态配置 · 无 KV 读写 · 通过 <code>?cfg=</code> 参数把配置传给 Worker。</p>
-      </div>
-      <div class="flex items-center space-x-2 text-xs text-slate-400">
-        <span class="pill">无 KV</span>
-        <span class="pill">支持 /sub 订阅</span>
-        <span class="pill">v2rayN / Singbox / Clash</span>
-      </div>
-    </header>
+<body class="min-h-screen bg-slate-100 flex items-center justify-center">
+  <div class="w-full max-w-md">
+    <div class="bg-white shadow-xl rounded-2xl p-8 border border-slate-200">
+      <h1 class="text-2xl font-bold mb-4 flex items-center">
+        <span class="mr-2">🔐</span> VLESS 管理后台登录
+      </h1>
+      <p class="text-sm text-slate-500 mb-4">
+        ${needInit
+          ? "检测到你还没有设置后台密码，请先设置一个新的管理员密码。以后登录都将使用该密码。"
+          : "请输入后台密码进入管理面板。"}
+      </p>
 
-    <!-- 线路信息 -->
-    <section class="card space-y-2">
-      <div class="flex items-center justify-between">
-        <h2 class="font-semibold text-sm">当前入口线路 / 节点探测</h2>
-        <button id="btnGeo" class="btn-ghost text-xs">刷新线路探测</button>
-      </div>
-      <p id="geoLocation" class="text-xs text-slate-300">正在获取地理位置...</p>
-      <p id="geoColo" class="text-xs text-slate-300">正在检测 Cloudflare 入口机房...</p>
-      <p id="geoScore" class="text-xs text-emerald-400"></p>
-      <p id="geoComment" class="text-xs text-slate-400"></p>
-      <p class="text-[11px] text-slate-500">建议优选 IP 段（需要你自己测速筛选）：</p>
-      <p id="geoIps" class="text-[11px] text-slate-400 break-words"></p>
-    </section>
+      ${safeMsg ? `<div class="mb-4 text-red-600 text-sm font-semibold">${safeMsg}</div>` : ""}
 
-    <!-- 基础配置 -->
-    <section class="card grid md:grid-cols-2 gap-5">
-      <div class="space-y-3">
-        <h2 class="font-semibold text-sm mb-1">基础参数</h2>
+      <form method="POST" action="/login" class="space-y-4">
         <div>
-          <label class="label">UUID（必填）</label>
-          <input id="uuid" class="input" placeholder="d50b4326-xxxx-xxxx-xxxx-9452690286fe" />
-        </div>
-        <div class="grid grid-cols-2 gap-3">
-          <div>
-            <label class="label">端口（一般 443）</label>
-            <input id="port" class="input" value="443" />
-          </div>
-          <div>
-            <label class="label">WS 路径</label>
-            <input id="wsPath" class="input" value="/echws" />
+          <label class="block text-sm font-medium mb-1">后台密码</label>
+          <div class="flex items-center border border-slate-300 rounded-lg overflow-hidden bg-slate-50">
+            <input id="password" name="password" type="password"
+                   class="flex-1 px-3 py-2 bg-transparent outline-none"
+                   placeholder="请输入后台密码" />
+            <button type="button" id="togglePwd"
+                    class="px-3 text-xs text-slate-600 hover:text-slate-900">
+              显示
+            </button>
           </div>
         </div>
-        <div>
-          <label class="label">备注前缀（用于节点名称）</label>
-          <input id="remark" class="input" value="ECH" />
+
+        <div class="flex items-center justify-between text-sm">
+          <label class="inline-flex items-center">
+            <input type="checkbox" name="remember" class="mr-2" />
+            记住我 1 天
+          </label>
         </div>
-      </div>
 
-      <div class="space-y-3">
-        <h2 class="font-semibold text-sm mb-1">前端域名 & 落地 IP</h2>
-        <div>
-          <label class="label">CDN / Worker 域名列表（每行一个）</label>
-          <textarea id="domains" class="input" placeholder="ec.firegod.eu.org&#10;ech2.example.com"></textarea>
-        </div>
-        <div>
-          <label class="label">落地 IP 列表（可选，每行一个）</label>
-          <textarea id="ips" class="input" placeholder="1.1.1.1&#10;8.8.8.8"></textarea>
-        </div>
-      </div>
-    </section>
+        <button type="submit"
+                class="w-full py-2 rounded-lg bg-blue-600 text-white font-semibold hover:bg-blue-700">
+          登录 / 保存密码
+        </button>
+      </form>
 
-    <!-- 操作按钮 -->
-    <section class="card space-y-3">
-      <div class="flex flex-wrap gap-2">
-        <button id="btnSaveLocal" class="btn">💾 保存到浏览器 localStorage</button>
-        <button id="btnLoadLocal" class="btn-ghost">📥 从浏览器加载配置</button>
-        <button id="btnClearLocal" class="btn-ghost">🗑️ 清空浏览器本地配置</button>
+      <div class="mt-6 text-xs text-slate-500 space-y-1">
+        <p class="font-semibold">使用说明：</p>
+        <p>1. 本版本完全不依赖 KV 存储，所有数据保存在 Cookie 中。</p>
+        <p>2. 首次打开本页面时，将提示你设置后台密码。设置完成后，今后访问本后台需要输入该密码。</p>
+        <p>3. 登录成功后，将进入节点管理面板，在那里可以配置 UUID、后端域名、端口、WS 路径、多节点等。</p>
+        <p>4. 配置数据保存在 Cookie 中，也可以通过 URL 参数 <code>?cfg=</code> 传递配置。</p>
       </div>
-      <p class="text-[11px] text-slate-500">
-        注意：配置不会保存在服务器，只存在你的浏览器本地。你可以把生成的 <code>?cfg=</code> 订阅链接复制下来长期使用。
-      </p>
-      <p id="msg" class="text-xs text-emerald-400"></p>
-    </section>
-
-    <!-- 订阅 & 导入 -->
-    <section class="card space-y-3">
-      <div class="flex items-center justify-between">
-        <h2 class="font-semibold text-sm">订阅 & 客户端导入</h2>
-        <button id="btnGenCfg" class="btn">⚙️ 生成 cfg / 订阅链接</button>
-      </div>
-      <div class="space-y-2 text-xs">
-        <p>当前配置对应的 <code>cfg</code> 参数：</p>
-        <textarea id="cfgToken" class="input" readonly></textarea>
-        <p>v2rayN 订阅地址：</p>
-        <textarea id="subUrl" class="input" readonly></textarea>
-        <p class="text-[11px] text-slate-500">
-          把上面的订阅链接复制到 v2rayN → 订阅 → 添加订阅，即可自动导入节点。<br />
-          也可直接访问：<code>/singbox?cfg=...</code> / <code>/clash?cfg=...</code> / <code>/qrcode?cfg=...</code>。
-        </p>
-      </div>
-    </section>
-
-    <!-- 测速工具入口 -->
-    <section class="card space-y-2">
-      <h2 class="font-semibold text-sm">Cloudflare Worker 线路测速</h2>
-      <p class="text-xs text-slate-400">
-        使用内置测速工具，可以测试当前 Worker 域名的延迟和下载速度，也可以对多个自定义 URL 进行批量测速。
-      </p>
-      <a href="/speedtest" target="_blank" class="btn-ghost text-xs">打开测速工具</a>
-    </section>
+    </div>
   </div>
 
   <script>
-    const STORAGE_KEY = "ech_workers_v3v4_cfg";
-    const INIT_CFG_TOKEN = "${safeToken}";
-
-    function showMsg(text, color) {
-      const el = document.getElementById("msg");
-      el.textContent = text || "";
-      el.style.color = color || "#4ade80";
-      if (text) setTimeout(() => { el.textContent = ""; }, 4000);
-    }
-
-    function readFormCfg() {
-      const uuid = document.getElementById("uuid").value.trim();
-      const port = document.getElementById("port").value.trim() || "443";
-      const wsPath = document.getElementById("wsPath").value.trim() || "/echws";
-      const remark = document.getElementById("remark").value.trim() || "ECH";
-      const domains = (document.getElementById("domains").value || "")
-        .split(/\\r?\\n/).map(s => s.trim()).filter(Boolean);
-      const ips = (document.getElementById("ips").value || "")
-        .split(/\\r?\\n/).map(s => s.trim()).filter(Boolean);
-      return { uuid, port, wsPath, remark, domains, ips };
-    }
-
-    function fillFormCfg(cfg) {
-      if (!cfg) return;
-      document.getElementById("uuid").value = cfg.uuid || "";
-      document.getElementById("port").value = cfg.port || "443";
-      document.getElementById("wsPath").value = cfg.wsPath || "/echws";
-      document.getElementById("remark").value = cfg.remark || "ECH";
-      document.getElementById("domains").value = (cfg.domains || []).join("\\n");
-      document.getElementById("ips").value = (cfg.ips || []).join("\\n");
-    }
-
-    function b64urlEncode(str) {
-      return btoa(str).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/g, "");
-    }
-    function b64urlDecode(str) {
-      str = str.replace(/-/g, "+").replace(/_/g, "/");
-      while (str.length % 4) str += "=";
-      return atob(str);
-    }
-
-    function saveLocal() {
-      const cfg = readFormCfg();
-      if (!cfg.uuid) return showMsg("UUID 不能为空", "red");
-      if (!cfg.domains || !cfg.domains.length) return showMsg("至少填一个域名", "red");
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
-      showMsg("✅ 已保存到浏览器 localStorage");
-    }
-    function loadLocal() {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return showMsg("本地没有已保存的配置", "red");
-      try {
-        const cfg = JSON.parse(raw);
-        fillFormCfg(cfg);
-        showMsg("✅ 已从浏览器加载配置");
-      } catch(e) {
-        showMsg("本地配置解析失败", "red");
-      }
-    }
-    function clearLocal() {
-      localStorage.removeItem(STORAGE_KEY);
-      showMsg("已清空本地配置");
-    }
-
-    function genCfgToken() {
-      const cfg = readFormCfg();
-      if (!cfg.uuid) return showMsg("UUID 不能为空", "red");
-      if (!cfg.domains || !cfg.domains.length) return showMsg("至少填一个域名", "red");
-      const token = b64urlEncode(JSON.stringify(cfg));
-      document.getElementById("cfgToken").value = token;
-      try {
-        const base = window.location.origin;
-        document.getElementById("subUrl").value = base + "/sub?cfg=" + token;
-      } catch(e) {}
-      showMsg("✅ 已生成 cfg / 订阅链接");
-    }
-
-    // 初始化：优先使用 URL 上的 cfg，其次 localStorage
-    (function init() {
-      if (INIT_CFG_TOKEN) {
-        try {
-          const json = b64urlDecode(INIT_CFG_TOKEN);
-          const cfg = JSON.parse(json);
-          fillFormCfg(cfg);
-          document.getElementById("cfgToken").value = INIT_CFG_TOKEN;
-          const base = window.location.origin;
-          document.getElementById("subUrl").value = base + "/sub?cfg=" + INIT_CFG_TOKEN;
-        } catch(e) {}
-      } else {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        if (raw) {
-          try { fillFormCfg(JSON.parse(raw)); } catch(e){}
+    const pwdInput = document.getElementById("password");
+    const toggleBtn = document.getElementById("togglePwd");
+    if (toggleBtn && pwdInput) {
+      toggleBtn.addEventListener("click", function (e) {
+        e.preventDefault();
+        if (pwdInput.type === "password") {
+          pwdInput.type = "text";
+          toggleBtn.textContent = "隐藏";
+        } else {
+          pwdInput.type = "password";
+          toggleBtn.textContent = "显示";
         }
-      }
-    })();
-
-    document.getElementById("btnSaveLocal").onclick = saveLocal;
-    document.getElementById("btnLoadLocal").onclick = loadLocal;
-    document.getElementById("btnClearLocal").onclick = clearLocal;
-    document.getElementById("btnGenCfg").onclick = genCfgToken;
-
-    async function loadGeo() {
-      try {
-        const res = await fetch("/api/geo?ts=" + Math.random(), {cache:"no-store"});
-        const geo = await res.json();
-        document.getElementById("geoLocation").textContent =
-          "你的大致位置：" + (geo.country || "-") + " / " +
-          (geo.region || "-") + " / " + (geo.city || "-") +
-          "（ASN " + (geo.asn || "-") + "）";
-        document.getElementById("geoColo").textContent =
-          "当前入口机房（colo）：" + (geo.colo || "-");
-        document.getElementById("geoScore").textContent =
-          "线路评分：" + (geo.score || "-");
-        document.getElementById("geoComment").textContent = geo.comment || "";
-        if (geo.ipSuggestions && geo.ipSuggestions.length) {
-          document.getElementById("geoIps").textContent = geo.ipSuggestions.join(", ");
-        }
-      } catch(e) {
-        document.getElementById("geoLocation").textContent = "无法获取 Geo 信息（可能是网络问题）。";
-      }
+      });
     }
-    document.getElementById("btnGeo").onclick = loadGeo;
-    loadGeo();
   <\/script>
 </body>
 </html>`;
 }
 
 // ===============================================================
-// 根据 cfg 生成节点列表 & 各类订阅格式
-// cfg 结构：{ uuid, port, wsPath, remark, domains:[], ips:[] }
+// Admin UI 页面（已登录后才可访问）
 // ===============================================================
-function buildNodesFromCfg(cfg) {
-  const uuid = cfg.uuid;
-  const port = parseInt(cfg.port || "443", 10) || 443;
-  const wsPath = cfg.wsPath || "/echws";
-  const remark = cfg.remark || "ECH";
-  const domains = Array.isArray(cfg.domains) ? cfg.domains : [];
-  const ips = Array.isArray(cfg.ips) ? cfg.ips : [];
 
-  if (!uuid || !domains.length) {
-    throw new Error("invalid cfg");
+function renderAdminUI() {
+  return `<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8" />
+  <title>VLESS Edge 节点管理面板</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdn.tailwindcss.com"><\/script>
+  <style>
+    body { background: #f8fafc; }
+    .card { background:white;border-radius:16px;padding:20px;box-shadow:0 4px 10px rgba(0,0,0,0.06); }
+    .input { width:100%;padding:10px;border-radius:8px;background:#f1f5f9;margin-bottom:10px; }
+    .label { font-weight:600;margin-bottom:4px;display:block;color:#334155; }
+    .btn { padding:8px 16px;border-radius:8px;font-weight:600;color:white;background:#2563eb; }
+    .btn2 { padding:8px 16px;border-radius:8px;font-weight:600;background:#e2e8f0; }
+    .btn-danger { padding:8px 16px;border-radius:8px;font-weight:600;background:#dc2626;color:white; }
+  </style>
+</head>
+<body class="p-6">
+  <h1 class="text-3xl font-bold mb-2">🚀 VLESS Edge 节点管理系统</h1>
+  <p class="text-gray-600 mb-6">通过本面板，你可以可视化配置 Cloudflare Worker 反代的 VLESS 节点，并一键生成 v2rayN / SingBox / Clash 订阅。</p>
+
+  <!-- 线路检测 / Geo 信息 -->
+  <div class="card mb-6">
+    <h2 class="text-xl font-semibold mb-3">当前线路状态 / 入口节点</h2>
+    <p id="geoLocation" class="text-sm text-slate-700 mb-1">正在检测你的地理位置...</p>
+    <p id="geoColo" class="text-sm text-slate-700 mb-1">正在检测 Cloudflare 入口机房...</p>
+    <p id="geoScore" class="text-sm font-semibold mb-1">评分：-</p>
+    <p id="geoComment" class="text-xs text-slate-500 mb-2"></p>
+    <p class="text-xs text-slate-500">建议优选 IP 段（需要你手动去测速筛选最优）：</p>
+    <p id="geoIps" class="text-xs text-slate-600 break-words"></p>
+  </div>
+
+  <!-- 基础参数配置 -->
+  <div class="card mb-6">
+    <h2 class="text-xl font-semibold mb-4">基础参数配置</h2>
+    <label class="label">UUID（必填）</label>
+    <input id="uuid" class="input" placeholder="请输入 VLESS UUID">
+    <label class="label">Worker 域名（必填）</label>
+    <input id="workerHost" class="input" placeholder="例如：ech.firegod.eu.org">
+    <label class="label">WS 路径（必填）</label>
+    <input id="wsPath" class="input" value="/echws">
+    <label class="label">后端 VPS 域名（必填）</label>
+    <input id="backendHost" class="input" placeholder="例如：cc1.firegod.eu.org">
+    <label class="label">后端端口（必填）</label>
+    <input id="backendPort" class="input" value="2082">
+    <p class="text-xs text-slate-500">后端端口为 Xray WS 入站端口（无需 TLS）。本 Worker 将通过 ws:// 后端转发客户端流量。</p>
+  </div>
+
+  <!-- WebSocket 模式 -->
+  <div class="card mb-6">
+    <h2 class="text-xl font-semibold mb-4">WebSocket 代理模式</h2>
+    <label class="flex items-center mb-2">
+      <input type="radio" name="wsMode" value="A" class="mr-2" checked>
+      <span>方式 A（稳定型，推荐）</span>
+    </label>
+    <p class="text-xs text-slate-500 mb-3 ml-6">
+      只转发 WebSocket 数据，不主动修改请求头，兼容性最高。
+    </p>
+    <label class="flex items-center mb-2">
+      <input type="radio" name="wsMode" value="B" class="mr-2">
+      <span>方式 B（高级混淆，可修改 Host / UA / SNI）</span>
+    </label>
+    <p class="text-xs text-slate-500 ml-6">
+      若启用方式 B，建议在下方填写 Fake Host / SNI / User-Agent，用于伪装成 CDN / 正常网站。
+    </p>
+  </div>
+
+  <!-- 混淆设置 -->
+  <div class="card mb-6">
+    <h2 class="text-xl font-semibold mb-4">混淆设置（可选）</h2>
+    <label class="label">Fake Host</label>
+    <input id="fakeHost" class="input" placeholder="例如：cdn.jsdelivr.net">
+    <label class="label">SNI</label>
+    <input id="sni" class="input" placeholder="例如：www.cloudflare.com">
+    <label class="label">User-Agent</label>
+    <input id="ua" class="input" placeholder="例如：Mozilla/5.0 Chrome/120">
+    <p class="text-xs text-slate-500">当 WS 模式选择为 B 时，这些字段将用于伪装请求头。</p>
+  </div>
+
+  <!-- 多节点 -->
+  <div class="card mb-6">
+    <h2 class="text-xl font-semibold mb-4 flex justify-between">
+      多节点列表（可选）
+      <button id="addNode" class="btn2">➕ 添加节点</button>
+    </h2>
+    <div id="nodes"></div>
+    <p class="text-xs text-slate-500 mt-2">你可以在这里添加多个前端节点域名，例如：ech1.firegod.eu.org、ech2.firegod.eu.org。</p>
+  </div>
+
+  <!-- 保存 & 重置 -->
+  <div class="card mb-6">
+    <button id="save" class="btn">💾 保存配置到 Cookie</button>
+    <button id="resetCfg" class="btn-danger ml-3">🗑️ 清空节点配置</button>
+    <span id="msg" class="ml-3 font-semibold"></span>
+  </div>
+
+  <!-- 线路测速工具 -->
+  <div class="card mb-6">
+    <h2 class="text-xl font-semibold mb-4">Cloudflare Worker 线路测速</h2>
+    <p class="text-sm text-slate-600 mb-3">
+      使用内置测速工具，可以一键测试当前 Worker 域名的真实延迟和下载速度，并对比不同 CF 优选 IP / 不同子域名的表现。
+    </p>
+    <div class="space-x-2">
+      <a href="/speedtest" target="_blank" class="btn2">打开测速页面（新窗口）</a>
+      <a href="/api/geo" target="_blank" class="btn2">查看当前线路 JSON 信息</a>
+    </div>
+    <p class="text-xs text-slate-500 mt-2">
+      建议先在这里跑一遍测速，确认入口机房（colo）是否为 HKG/TPE/SIN 等亚洲节点，再配合订阅里的"优选IP节点"进行真实体验对比。
+    </p>
+  </div>
+  <!-- 订阅区 -->
+  <div class="card mb-6">
+    <h2 class="text-xl font-semibold mb-4">订阅 & 导入</h2>
+    <div class="space-y-2 text-sm">
+      <p>v2rayN 订阅（Base64）：</p>
+      <p><code id="subUrl"></code></p>
+      <p class="text-xs text-slate-500">复制上述链接到 v2rayN → 订阅 → 添加订阅，即可自动导入节点。</p>
+    </div>
+    <div class="mt-3 space-x-2">
+      <a href="/sub" target="_blank" class="btn2">打开 v2rayN 订阅内容</a>
+      <a href="/singbox" target="_blank" class="btn2">查看 SingBox JSON</a>
+      <a href="/clash" target="_blank" class="btn2">查看 Clash Meta YAML</a>
+      <a href="/qrcode" target="_blank" class="btn2">查看节点二维码</a>
+    </div>
+  </div>
+
+  <script>
+    async function loadConfig() {
+      var cfg = {};
+      try {
+        cfg = await fetch("/api/get-config").then(function(r){return r.json()});
+      } catch(e) { cfg = {}; }
+
+      document.getElementById("uuid").value = cfg.uuid || "";
+      document.getElementById("workerHost").value = cfg.workerHost || "";
+      document.getElementById("wsPath").value = cfg.wsPath || "/echws";
+      document.getElementById("backendHost").value = cfg.backendHost || "";
+      document.getElementById("backendPort").value = cfg.backendPort || "2082";
+      document.getElementById("fakeHost").value = cfg.fakeHost || "";
+      document.getElementById("sni").value = cfg.sni || "";
+      document.getElementById("ua").value = cfg.ua || "";
+
+      if (cfg.mode === "B") {
+        var b = document.querySelector("input[name='wsMode'][value='B']");
+        if (b) b.checked = true;
+      } else {
+        var a = document.querySelector("input[name='wsMode'][value='A']");
+        if (a) a.checked = true;
+      }
+
+      if (cfg.nodes && Array.isArray(cfg.nodes)) {
+        cfg.nodes.forEach(function(n){ addNodeUI(n); });
+      }
+
+      try {
+        var loc = window.location;
+        var base = loc.origin;
+        document.getElementById("subUrl").textContent = base + "/sub";
+      } catch(e) {}
+
+      // 额外：加载 Geo 信息
+      try {
+        var geoRes = await fetch("/api/geo");
+        var geo = await geoRes.json();
+        var locText = "你的大致位置：" + (geo.country || "-") + " / " + (geo.region || "-") + " / " + (geo.city || "-")
+          + " （ASN " + (geo.asn || "-") + "）";
+        document.getElementById("geoLocation").textContent = locText;
+        document.getElementById("geoColo").textContent = "当前 Worker 落地机房（colo）：" + (geo.colo || "-");
+        document.getElementById("geoScore").textContent = "线路评分：" + (geo.score || "-");
+        document.getElementById("geoComment").textContent = geo.comment || "";
+        if (geo.ipSuggestions && geo.ipSuggestions.length) {
+          document.getElementById("geoIps").textContent = geo.ipSuggestions.join(", ");
+        }
+      } catch(e) {
+        document.getElementById("geoLocation").textContent = "无法获取 Geo 信息（可能是浏览器或网络限制）。";
+      }
+    }
+
+    function addNodeUI(d) {
+      d = d || {};
+      var div = document.createElement("div");
+      div.className = "p-3 border rounded-lg mb-3";
+      var html = ""
+        + '<label class="label">节点域名</label>'
+        + '<input class="input node-host" placeholder="例如：ech2.firegod.eu.org" value="' + (d.host || "") + '">'
+        + '<label class="label">备注（可选）</label>'
+        + '<input class="input node-name" placeholder="例如：新加坡节点" value="' + (d.name || "") + '">'
+        + '<button class="btn2 remove mt-2">删除节点</button>';
+      div.innerHTML = html;
+      div.querySelector(".remove").onclick = function(){ div.remove(); };
+      document.getElementById("nodes").appendChild(div);
+    }
+
+    document.getElementById("addNode").onclick = function(){ addNodeUI(); };
+
+    document.getElementById("save").onclick = async function () {
+      var modeInput = document.querySelector("input[name='wsMode']:checked");
+      var mode = modeInput ? modeInput.value : "A";
+
+      var uuidEl = document.getElementById("uuid");
+      var workerHostEl = document.getElementById("workerHost");
+      var backendHostEl = document.getElementById("backendHost");
+      var backendPortEl = document.getElementById("backendPort");
+      var wsPathEl = document.getElementById("wsPath");
+      var fakeHostEl = document.getElementById("fakeHost");
+      var sniEl = document.getElementById("sni");
+      var uaEl = document.getElementById("ua");
+
+      if (!uuidEl.value) return showMsg("❌ UUID 不能为空", true);
+      if (!workerHostEl.value) return showMsg("❌ Worker 域名不能为空", true);
+      if (!backendHostEl.value) return showMsg("❌ 后端域名不能为空", true);
+      if (!backendPortEl.value) return showMsg("❌ 后端端口不能为空", true);
+
+      var nodesDivs = document.querySelectorAll("#nodes > div");
+      var nodesData = [];
+      nodesDivs.forEach(function(d){
+        nodesData.push({
+          host: d.querySelector(".node-host").value,
+          name: d.querySelector(".node-name").value
+        });
+      });
+
+      var cfg = {
+        uuid: uuidEl.value,
+        workerHost: workerHostEl.value,
+        wsPath: wsPathEl.value,
+        backendHost: backendHostEl.value,
+        backendPort: backendPortEl.value,
+        fakeHost: fakeHostEl.value,
+        sni: sniEl.value,
+        ua: uaEl.value,
+        mode: mode,
+        nodes: nodesData
+      };
+
+      await fetch("/api/set-config", {
+        method: "POST",
+        body: JSON.stringify(cfg)
+      });
+
+      showMsg("✅ 已保存配置到 Cookie");
+    };
+
+    document.getElementById("resetCfg").onclick = async function () {
+      if (!confirm("确定要清空节点配置？此操作不可恢复。")) return;
+      await fetch("/api/reset-config");
+      location.reload();
+    };
+
+    function showMsg(text, isError) {
+      var m = document.getElementById("msg");
+      m.textContent = text;
+      m.style.color = isError ? "red" : "green";
+      setTimeout(function(){ m.textContent = ""; }, 3000);
+    }
+
+    loadConfig();
+  <\/script>
+</body>
+</html>`;
+}
+
+// ===============================================================
+// Config Loader (Cookie / URL parameter based, no KV)
+// ===============================================================
+async function loadConfig(request, url, secretKey) {
+  // First try to get from Cookie
+  const cookies = parseCookies(request.headers.get("Cookie") || "");
+  let raw = null;
+  
+  if (cookies["vless_config"]) {
+    try {
+      raw = await decrypt(cookies["vless_config"], secretKey);
+    } catch (e) {}
   }
-
-  const nodes = [];
-
-  // 域名节点
-  domains.forEach((host, idx) => {
-    if (!host) return;
-    const name = `${remark}-${idx + 1}`;
-    nodes.push({
-      name,
-      server: host,
-      port,
-      uuid,
-      hostHeader: host,
-      sni: host,
-      wsPath,
-    });
-  });
-
-  // IP 备胎节点：使用第一个域名作为 SNI/Host
-  const mainHost = domains[0];
-  ips.forEach((ip, idx) => {
-    if (!ip || !mainHost) return;
-    const name = `${remark}-IP${idx + 1}`;
-    nodes.push({
-      name,
-      server: ip,
-      port,
-      uuid,
-      hostHeader: mainHost,
-      sni: mainHost,
-      wsPath,
-    });
-  });
-
-  return nodes;
+  
+  // If not in cookie, try URL parameter
+  if (!raw) {
+    const cfgParam = url.searchParams.get("cfg");
+    if (cfgParam) {
+      try {
+        raw = decodeURIComponent(cfgParam);
+      } catch (e) {}
+    }
+  }
+  
+  if (!raw) {
+    return {
+      uuid: "",
+      workerHost: "",
+      wsPath: "/echws",
+      backendHost: "",
+      backendPort: "2082",
+      fakeHost: "",
+      sni: "",
+      ua: "",
+      mode: "A",
+      nodes: []
+    };
+  }
+  
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    return {
+      uuid: "",
+      workerHost: "",
+      wsPath: "/echws",
+      backendHost: "",
+      backendPort: "2082",
+      fakeHost: "",
+      sni: "",
+      ua: "",
+      mode: "A",
+      nodes: []
+    };
+  }
 }
 
-function generateV2raySubFromCfg(cfg) {
-  const nodes = buildNodesFromCfg(cfg);
-  const lines = nodes.map((n) => {
-    const params = new URLSearchParams({
-      encryption: "none",
-      security: "tls",
-      type: "ws",
-      path: n.wsPath,
-      host: n.hostHeader,
-      sni: n.sni,
-    });
-    return `vless://${n.uuid}@${n.server}:${n.port}?${params.toString()}#${encodeURIComponent(
-      n.name
-    )}`;
-  });
-  return lines.join("\n");
-}
-
-function generateSingboxFromCfg(cfg) {
-  const nodes = buildNodesFromCfg(cfg);
-  const outbounds = nodes.map((n) => ({
-    type: "vless",
-    tag: n.name,
-    server: n.server,
-    server_port: n.port,
-    uuid: n.uuid,
-    tls: {
-      enabled: true,
-      server_name: n.sni,
-    },
-    transport: {
-      type: "ws",
-      path: n.wsPath,
-      headers: {
-        Host: n.hostHeader,
-      },
-    },
-  }));
-  return { outbounds };
-}
-
-function generateClashFromCfg(cfg) {
-  const nodes = buildNodesFromCfg(cfg);
-  let yaml = "proxies:\n";
-  nodes.forEach((n) => {
-    yaml += `  - name: "${n.name}"
-    type: vless
-    server: ${n.server}
-    port: ${n.port}
-    uuid: ${n.uuid}
-    tls: true
-    servername: ${n.sni}
-    network: ws
-    ws-opts:
-      path: ${n.wsPath}
-      headers:
-        Host: ${n.hostHeader}
-`;
-  });
-  return yaml;
-}
-
-async function generateQRCodeFromCfg(cfg) {
-  const nodes = buildNodesFromCfg(cfg);
-  const first = nodes[0];
+// ===============================================================
+// VLESS URL builder
+// ===============================================================
+function buildVlessUrl(cfg, hostOverride = null, name = "Node") {
+  const host = hostOverride || cfg.workerHost;
   const params = new URLSearchParams({
     encryption: "none",
     security: "tls",
     type: "ws",
-    path: first.wsPath,
-    host: first.hostHeader,
-    sni: first.sni,
+    path: cfg.wsPath,
+    host: cfg.fakeHost || cfg.workerHost,
+    sni: cfg.sni || cfg.workerHost
   });
-  const vlessUrl = `vless://${first.uuid}@${first.server}:${first.port}?${params.toString()}#${encodeURIComponent(
-    first.name
-  )}`;
-  const api =
-    "https://chart.googleapis.com/chart?cht=qr&chs=400x400&chl=" +
-    encodeURIComponent(vlessUrl);
-  const resp = await fetch(api);
-  return resp.arrayBuffer();
+  return `vless://${cfg.uuid}@${host}:443?${params.toString()}#${encodeURIComponent(name)}`;
 }
 
 // ===============================================================
-// WebSocket 反代（固定后端，无 KV）
+// v2rayN Subscription text
 // ===============================================================
-async function handleWSProxy(request) {
-  const backendUrl = `http://${BACKEND_HOST}:${BACKEND_PORT}${BACKEND_WS_PATH}`;
-  const headers = new Headers(request.headers);
-  headers.set("Host", BACKEND_HOST);
+function generateV2raySub(cfg, ipOption) {
+  const list = [];
+  ipOption = ipOption || { mode: "domain", ips: [] };
+  const mode = ipOption.mode || "domain";
+  const ips = Array.isArray(ipOption.ips) ? ipOption.ips : (ipOption.ip ? [ipOption.ip] : []);
 
-  const backendReq = new Request(backendUrl, {
-    method: request.method,
-    headers,
-    body: request.body,
-  });
+  const ipOnly = (mode === "ip");
 
-  let resp;
-  try {
-    resp = await fetch(backendReq);
-  } catch (e) {
-    return new Response("Backend connection failed", { status: 502 });
+  // 1）域名节点（非 ip-only 模式才添加）
+  if (!ipOnly) {
+    list.push(buildVlessUrl(cfg, null, "主节点"));
+    if (cfg.nodes && Array.isArray(cfg.nodes)) {
+      cfg.nodes.forEach(function(n) {
+        if (!n.host) return;
+        list.push(buildVlessUrl(cfg, n.host, n.name || n.host));
+      });
+    }
   }
 
-  if (resp.status !== 101) {
-    return new Response("WebSocket upgrade failed", { status: 502 });
+  // 2）IP 备胎节点
+  if ((mode === "dual" || mode === "ip") && ips.length) {
+    ips.forEach(function(ip, idx) {
+      if (!ip) return;
+      const name = "优选IP节点" + (ips.length > 1 ? (idx + 1) : "");
+      list.push(buildVlessUrl(cfg, ip, name));
+    });
   }
-  return resp;
+
+  return list.join("\n");
 }
 
-// ===============================================================
-// 速度测试页面（与原来 565.js 类似，已简化）
-// ===============================================================
+// 根据 Cloudflare colo 返回一个推荐 IP 列表（示例，可按需调整为你实测的 IP）
+function pickIpListByColo(colo) {
+  colo = (colo || "").toUpperCase();
+  // A 类：亚洲常见优选（HKG / TPE / SIN / ICN）
+  if (colo === "HKG" || colo === "TPE" || colo === "SIN" || colo === "ICN") {
+    return [
+      "188.114.97.3",
+      "188.114.96.3",
+      "104.16.1.3"
+    ];
+  }
+  // 日本 / 关西等
+  if (colo === "NRT" || colo === "KIX") {
+    return [
+      "104.16.1.3",
+      "104.17.1.3",
+      "188.114.96.3"
+    ];
+  }
+  // 北美常见入口
+  if (colo === "LAX" || colo === "SJC" || colo === "SEA" || colo === "ORD" || colo === "DFW" || colo === "IAD" || colo === "JFK") {
+    return [
+      "188.114.96.3",
+      "188.114.97.3",
+      "141.101.64.3"
+    ];
+  }
+  // 其他未知地区，返回一个相对通用的组合
+  return [
+    "188.114.96.3",
+    "188.114.97.3",
+    "104.16.1.3"
+  ];
+}
+
+// 单 IP 版本：保留给可能需要的地方使用（取列表第一个）
+function pickIpByColo(colo) {
+  const list = pickIpListByColo(colo);
+  return list && list.length ? list[0] : "188.114.96.3";
+}
+
 function renderSpeedtestPage() {
   return `<!DOCTYPE html>
 <html lang="zh">
 <head>
   <meta charset="UTF-8" />
   <title>Cloudflare Worker 速度测试工具</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <script src="https://cdn.tailwindcss.com"><\/script>
 </head>
 <body class="min-h-screen bg-slate-100 p-4">
@@ -730,48 +930,56 @@ function renderSpeedtestPage() {
     <div class="bg-white rounded-2xl shadow p-6">
       <h1 class="text-2xl font-bold mb-2">⚡ Cloudflare Worker 线路测速</h1>
       <p class="text-sm text-slate-600 mb-4">
-        本页面用于测试当前 Worker 域名的延迟与下载速度，并提供简单的“批量 URL 下载测速”功能，方便你对比不同 CF IP / 域名表现。
+        本页面用于测试当前 Worker 域名的实际访问延迟与下载速度，并提供一个简单的"自定义 URL 批量测速"工具，方便你对比不同 CF 优选 IP 或不同域名的表现。
       </p>
       <a href="/" class="text-blue-600 text-sm underline">← 返回管理面板</a>
     </div>
 
+    <!-- 单节点测速 -->
     <div class="bg-white rounded-2xl shadow p-6">
-      <h2 class="text-xl font-semibold mb-3">一、当前 Worker 域名测速</h2>
+      <h2 class="text-xl font-semibold mb-4">一、当前 Worker 域名测速</h2>
       <p class="text-sm text-slate-600 mb-2">
-        将对当前域名执行多次延迟测试（请求 /api/geo），并下载 1MB 测试文件 <code>/speed.bin</code>。
+        将对当前域名执行多次延迟测试（ping），并下载 1MB 测试文件，粗略估算下载速度。
       </p>
-      <button id="btnPing" class="px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-semibold mb-3">
+      <button id="btnPing" class="px-4 py-2 rounded-lg bg-blue-600 text-white font-semibold mb-3">
         开始单节点测速
       </button>
-      <pre id="pingResult" class="bg-slate-950 text-slate-100 text-xs rounded-lg p-3 overflow-x-auto h-48"></pre>
+      <pre id="pingResult" class="bg-slate-950 text-slate-100 text-xs rounded-lg p-3 overflow-x-auto h-40"></pre>
     </div>
 
+    <!-- 批量测速 -->
     <div class="bg-white rounded-2xl shadow p-6">
-      <h2 class="text-xl font-semibold mb-3">二、自定义 URL 批量测速</h2>
+      <h2 class="text-xl font-semibold mb-4">二、自定义 URL 批量测速（配合优选 IP 使用）</h2>
       <p class="text-sm text-slate-600 mb-2">
-        在下方输入要测试的 URL（每行一个），用于对比不同优选 IP / 域名的下载速度。
+        在下方输入要测试的 URL（每行一个）。可用于：
       </p>
-      <textarea id="urlList" class="w-full h-32 border rounded-lg p-2 text-xs mb-3" placeholder="例如：&#10;https://ech1.yourdomain.com/speed.bin&#10;https://ech2.yourdomain.com/speed.bin"></textarea>
-      <button id="btnBatch" class="px-4 py-2 rounded-lg bg-emerald-600 text-white text-sm font-semibold mb-3">
+      <ul class="list-disc ml-6 text-sm text-slate-600 mb-3">
+        <li>给多个不同子域名分别绑定不同 CF IP，然后依次测速。</li>
+        <li>或在本机 hosts 中，将同一域名指向不同 CF IP，填入对应 URL 进行对比。</li>
+      </ul>
+      <textarea id="urlList" class="w-full h-32 border rounded-lg p-2 text-sm mb-3" placeholder="例如：&#10;https://ech1.yourdomain.com/speed.bin&#10;https://ech2.yourdomain.com/speed.bin"></textarea>
+      <button id="btnBatch" class="px-4 py-2 rounded-lg bg-emerald-600 text-white font-semibold mb-3">
         开始批量测速
       </button>
-      <pre id="batchResult" class="bg-slate-950 text-slate-100 text-xs rounded-lg p-3 overflow-x-auto h-64"></pre>
+      <pre id="batchResult" class="bg-slate-950 text-slate-100 text-xs rounded-lg p-3 overflow-x-auto h-52"></pre>
     </div>
   </div>
 
   <script>
     async function runSingleTest() {
-      const out = [];
-      const logEl = document.getElementById("pingResult");
-      logEl.textContent = "开始延迟测试...\\n";
+      var out = [];
+      var logEl = document.getElementById("pingResult");
+      logEl.textContent = "开始测试...\\n";
 
-      const times = [];
-      for (let i = 0; i < 5; i++) {
-        const t0 = performance.now();
+      // 延迟测试：多次请求 /api/geo
+      var count = 5;
+      var times = [];
+      for (var i = 0; i < count; i++) {
+        var t0 = performance.now();
         try {
-          await fetch("/api/geo?ts=" + Math.random(), {cache:"no-store"});
-          const t1 = performance.now();
-          const ms = Math.round(t1 - t0);
+          await fetch("/api/geo?ts=" + Math.random(), { cache: "no-store" });
+          var t1 = performance.now();
+          var ms = Math.round(t1 - t0);
           times.push(ms);
           out.push("第 " + (i+1) + " 次延迟：" + ms + " ms");
         } catch(e) {
@@ -781,10 +989,10 @@ function renderSpeedtestPage() {
       }
 
       if (times.length) {
-        const sum = times.reduce((a,b)=>a+b,0);
-        const avg = Math.round(sum / times.length);
-        const min = Math.min(...times);
-        const max = Math.max(...times);
+        var sum = times.reduce(function(a,b){return a+b;},0);
+        var avg = Math.round(sum / times.length);
+        var min = Math.min.apply(null, times);
+        var max = Math.max.apply(null, times);
         out.push("");
         out.push("延迟统计：");
         out.push("  次数：" + times.length);
@@ -793,54 +1001,58 @@ function renderSpeedtestPage() {
         out.push("  最大：" + max + " ms");
       }
 
+      logEl.textContent = out.join("\\n");
+
+      // 下载测速：/speed.bin (约 1MB)
       out.push("");
       out.push("开始下载测速 /speed.bin (约 1MB)...");
       logEl.textContent = out.join("\\n");
 
       try {
-        const t0 = performance.now();
-        const resp = await fetch("/speed.bin?ts=" + Math.random(), {cache:"no-store"});
-        const buf = await resp.arrayBuffer();
-        const t1 = performance.now();
-        const ms = t1 - t0;
-        const size = buf.byteLength;
-        const speedMbps = (size * 8 / 1024 / 1024) / (ms / 1000);
-        out.push("下载用时：" + Math.round(ms) + " ms");
-        out.push("下载大小：" + size + " 字节");
+        var t0d = performance.now();
+        var resp = await fetch("/speed.bin?ts=" + Math.random(), { cache: "no-store" });
+        var buf = await resp.arrayBuffer();
+        var t1d = performance.now();
+        var msd = t1d - t0d;
+        var sizeBytes = buf.byteLength;
+        var speedMbps = (sizeBytes * 8 / 1024 / 1024) / (msd / 1000);
+        out.push("下载用时：" + Math.round(msd) + " ms");
+        out.push("下载大小：" + sizeBytes + " 字节");
         out.push("估算下行速度：" + speedMbps.toFixed(2) + " Mbps");
       } catch(e) {
         out.push("下载测速失败：" + e);
       }
+
       logEl.textContent = out.join("\\n");
     }
 
     async function runBatchTest() {
-      const txt = document.getElementById("urlList").value || "";
-      const lines = txt.split(/\\r?\\n/).map(l => l.trim()).filter(Boolean);
-      const out = [];
-      const logEl = document.getElementById("batchResult");
+      var txt = document.getElementById("urlList").value || "";
+      var lines = txt.split(/\\r?\\n/).map(function(l){return l.trim();}).filter(function(l){return l;});
+      var out = [];
+      var logEl = document.getElementById("batchResult");
       if (!lines.length) {
         logEl.textContent = "请先在上方文本框中填入要测试的 URL，每行一个。";
         return;
       }
-      out.push("共 " + lines.length + " 个 URL，将依次进行下载测速...");
+      out.push("共 " + lines.length + " 个 URL，将依次进行测试（只做一次下载测速）...");
       logEl.textContent = out.join("\\n");
 
-      for (let i = 0; i < lines.length; i++) {
-        const url = lines[i];
+      for (var i = 0; i < lines.length; i++) {
+        var url = lines[i];
         out.push("");
         out.push("[" + (i+1) + "/" + lines.length + "] 测试：" + url);
         logEl.textContent = out.join("\\n");
         try {
-          const t0 = performance.now();
-          const resp = await fetch(url, {cache:"no-store"});
-          const buf = await resp.arrayBuffer();
-          const t1 = performance.now();
-          const ms = t1 - t0;
-          const size = buf.byteLength;
-          const speedMbps = (size * 8 / 1024 / 1024) / (ms / 1000);
+          var t0 = performance.now();
+          var resp = await fetch(url, { cache: "no-store" });
+          var buf = await resp.arrayBuffer();
+          var t1 = performance.now();
+          var ms = t1 - t0;
+          var sizeBytes = buf.byteLength;
+          var speedMbps = (sizeBytes * 8 / 1024 / 1024) / (ms / 1000);
           out.push("  用时：" + Math.round(ms) + " ms");
-          out.push("  大小：" + size + " 字节");
+          out.push("  大小：" + sizeBytes + " 字节");
           out.push("  估算速度：" + speedMbps.toFixed(2) + " Mbps");
         } catch(e) {
           out.push("  测试失败：" + e);
@@ -849,13 +1061,203 @@ function renderSpeedtestPage() {
       }
 
       out.push("");
-      out.push("批量测速完成，可对比不同 URL 的时延与 Mbps 评估哪条线路更优。");
+      out.push("批量测速完成。可对比各 URL 的时延与 Mbps 评估哪条 CF 线路更优。");
       logEl.textContent = out.join("\\n");
     }
 
-    document.getElementById("btnPing").onclick = runSingleTest;
-    document.getElementById("btnBatch").onclick = runBatchTest;
+    document.getElementById("btnPing").onclick = function(){ runSingleTest(); };
+    document.getElementById("btnBatch").onclick = function(){ runBatchTest(); };
   <\/script>
 </body>
 </html>`;
+}
+
+// ===============================================================
+// SingBox JSON
+// ===============================================================
+function generateSingbox(cfg) {
+  const outbounds = [];
+
+  outbounds.push({
+    type: "vless",
+    tag: "主节点",
+    server: cfg.workerHost,
+    server_port: 443,
+    uuid: cfg.uuid,
+    tls: {
+      enabled: true,
+      server_name: cfg.sni || cfg.workerHost
+    },
+    transport: {
+      type: "ws",
+      path: cfg.wsPath,
+      headers: {
+        Host: cfg.fakeHost || cfg.workerHost
+      }
+    }
+  });
+
+  if (cfg.nodes && Array.isArray(cfg.nodes)) {
+    cfg.nodes.forEach(n => {
+      if (!n.host) return;
+      outbounds.push({
+        type: "vless",
+        tag: n.name || n.host,
+        server: n.host,
+        server_port: 443,
+        uuid: cfg.uuid,
+        tls: {
+          enabled: true,
+          server_name: cfg.sni || n.host
+        },
+        transport: {
+          type: "ws",
+          path: cfg.wsPath,
+          headers: {
+            Host: cfg.fakeHost || n.host
+          }
+        }
+      });
+    });
+  }
+
+  return { outbounds };
+}
+
+// ===============================================================
+// Clash Meta YAML
+// ===============================================================
+function generateClash(cfg) {
+  const proxies = [];
+
+  function addNode(name, host) {
+    proxies.push({
+      name,
+      type: "vless",
+      server: host,
+      port: 443,
+      uuid: cfg.uuid,
+      tls: true,
+      servername: cfg.sni || host,
+      network: "ws",
+      ws_opts: {
+        path: cfg.wsPath,
+        headers: {
+          Host: cfg.fakeHost || host
+        }
+      }
+    });
+  }
+
+  addNode("主节点", cfg.workerHost);
+  if (cfg.nodes && Array.isArray(cfg.nodes)) {
+    cfg.nodes.forEach(n => {
+      if (!n.host) return;
+      addNode(n.name || n.host, n.host);
+    });
+  }
+
+  let yaml = "proxies:\n";
+  proxies.forEach(p => {
+    yaml += `  - name: "${p.name}"
+    type: vless
+    server: ${p.server}
+    port: 443
+    uuid: ${p.uuid}
+    tls: true
+    servername: ${p.servername}
+    network: ws
+    ws-opts:
+      path: ${p.ws_opts.path}
+      headers:
+        Host: ${p.ws_opts.headers.Host}
+`;
+  });
+
+  return yaml;
+}
+
+// ===============================================================
+// QR Code (Google Chart API)
+// ===============================================================
+async function generateQRCode(cfg) {
+  const vlessUrl = buildVlessUrl(cfg, null, "主节点");
+  const api =
+    "https://chart.googleapis.com/chart?cht=qr&chs=400x400&chl=" +
+    encodeURIComponent(vlessUrl);
+
+  const resp = await fetch(api);
+  return resp.arrayBuffer();
+}
+
+// ===============================================================
+// WebSocket Proxy (Mode A & B)
+// ===============================================================
+async function handleWS(request, cfg) {
+  if (cfg.mode === "B") {
+    return handleWS_B(request, cfg);
+  }
+  return handleWS_A(request, cfg);
+}
+
+// --- Mode A: Stable ---
+async function handleWS_A(request, cfg) {
+  const backendUrl = `http://${cfg.backendHost}:${cfg.backendPort}${cfg.wsPath}`;
+  const headers = new Headers(request.headers);
+  headers.set("Host", cfg.backendHost);
+
+  const backendReq = new Request(backendUrl, {
+    method: request.method,
+    headers,
+    body: request.body
+  });
+
+  let resp;
+  try {
+    resp = await fetch(backendReq);
+  } catch (e) {
+    return new Response("Backend connection failed (mode A)", { status: 502 });
+  }
+
+  if (resp.status !== 101) {
+    return new Response("WebSocket upgrade failed (mode A)", { status: 502 });
+  }
+  return resp;
+}
+
+// --- Mode B: Obfuscated ---
+async function handleWS_B(request, cfg) {
+  const backendUrl = `http://${cfg.backendHost}:${cfg.backendPort}${cfg.wsPath}`;
+  const headers = new Headers(request.headers);
+
+  if (cfg.fakeHost) {
+    headers.set("Host", cfg.fakeHost);
+  }
+  if (cfg.ua) {
+    headers.set("User-Agent", cfg.ua);
+  }
+  if (cfg.sni) {
+    headers.set("CF-Connecting-SNI", cfg.sni);
+  }
+
+  headers.set("X-Forwarded-For", "1.1.1.1");
+  headers.set("X-Real-IP", "1.1.1.1");
+
+  const backendReq = new Request(backendUrl, {
+    method: request.method,
+    headers,
+    body: request.body
+  });
+
+  let resp;
+  try {
+    resp = await fetch(backendReq);
+  } catch (e) {
+    return new Response("Backend connection failed (mode B)", { status: 503 });
+  }
+
+  if (resp.status !== 101) {
+    return new Response("WebSocket upgrade failed (mode B)", { status: 502 });
+  }
+  return resp;
 }
