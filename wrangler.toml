@@ -1,5 +1,9 @@
 name = "6584"
 main = "index.js"
 compatibility_date = "2024-01-01"
-
 workers_dev = true
+
+[vars]
+# 在 Cloudflare Dashboard 或 wrangler.toml 中设置：
+# ADMIN_PASSWORD  登录密码（必填，建议随机复杂）
+# SESSION_SECRET  会话签名密钥（必填，建议随机 32+ 字符）
