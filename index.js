@@ -7,7 +7,7 @@
 // - Session token stored in Cookie (encrypted with SESSION_SECRET)
 // - Config stored in Cookie / URL parameters (no KV)
 // - Subscription endpoints: /sub, /singbox, /clash, /qrcode
-// - WebSocket VLESS proxy with mode A (stable) and B (obfuscated)
+// - WebSocket VLESS proxy with mode A (stable)
 // ---------------------------------------------------------------
 // IMPORTANT: This version does NOT require KV storage.
 // Environment Variables Required:
@@ -47,7 +47,6 @@ function base64Encode(str) {
     return result;
   } catch (e) {
     // Ultimate fallback: return empty string
-    console.error("Base64 encoding error:", e);
     return '';
   }
 }
@@ -208,7 +207,10 @@ export default {
       const body = await request.text();
       const encrypted = await encrypt(body, sessionSecret);
       const headers = new Headers();
-      headers.set("Set-Cookie", `vless_config=${encrypted}; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=31536000`);
+      // 先清除旧 Cookie，确保是新 Cookie
+      headers.append("Set-Cookie", `vless_config=; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=0`);
+      // 然后设置新 Cookie
+      headers.append("Set-Cookie", `vless_config=${encrypted}; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=31536000`);
       headers.set("content-type", "text/plain");
       return new Response("OK", { headers });
     }
@@ -294,7 +296,6 @@ export default {
           }
         });
       } catch (e) {
-        console.error("renderHealthPage error:", e);
         return new Response("健康检查页面渲染失败: " + e.message, {
           status: 500,
           headers: { "content-type": "text/plain; charset=utf-8" }
@@ -464,35 +465,9 @@ export default {
     if (pathname === "/sub") {
       try {
       const cfg = await loadConfig(request, url, sessionSecret);
-      
-      console.log("订阅请求 - 配置加载:", {
-        hasUuid: !!cfg?.uuid,
-        hasWorkerHost: !!cfg?.workerHost,
-        hasBackendHost: !!cfg?.backendHost,
-        hasBackendPort: !!cfg?.backendPort,
-        enablePreferredIP: cfg?.enablePreferredIP,
-        hasCookie: !!request.headers.get("Cookie"),
-        hasUrlParam: !!url.searchParams.get("cfg")
-      });
 
         // 验证配置是否完整
         if (!cfg || !cfg.uuid || !cfg.workerHost || !cfg.backendHost || !cfg.backendPort) {
-          // 配置不完整，记录详细日志
-          const missingFields = [];
-          if (!cfg?.uuid) missingFields.push("UUID");
-          if (!cfg?.workerHost) missingFields.push("Worker域名");
-          if (!cfg?.backendHost) missingFields.push("后端域名");
-          if (!cfg?.backendPort) missingFields.push("后端端口");
-          
-          console.error("Config incomplete. Missing fields:", missingFields.join(", "));
-          console.error("Config state:", {
-            hasUuid: !!cfg?.uuid,
-            hasWorkerHost: !!cfg?.workerHost,
-            hasBackendHost: !!cfg?.backendHost,
-            hasBackendPort: !!cfg?.backendPort,
-            cookieHeader: request.headers.get("Cookie") ? "present" : "missing"
-          });
-          
           // 返回空字符串（v2rayN 会显示为空订阅）
           return new Response("", {
             headers: { 
@@ -508,7 +483,6 @@ export default {
         const isAsiaColo = asiaColos.includes(colo);
         
         if (!cfg.enablePreferredIP && !isAsiaColo) {
-          console.log(`检测到非亚洲节点(${colo})，自动启用优选IP功能`);
           cfg.enablePreferredIP = true;
           // 设置默认值
           if (cfg.useWetest === undefined) cfg.useWetest = true;
@@ -531,9 +505,7 @@ export default {
         try {
           // pickIpListByColo现在是async函数，需要await
           ipList = await pickIpListByColo(colo, cfg);
-          console.log(`首次获取优选IP列表: ${ipList.length}个IP`, ipList.slice(0, 3));
         } catch (e) {
-          console.error("获取优选IP列表失败:", e);
           ipList = [];
         }
       }
@@ -545,7 +517,6 @@ export default {
         // 这样会包含1个原始域名节点 + 多个优选IP节点
         if (ipParam === "domain" || !ipParam) {
           finalIpParam = "dual";
-          console.log("自动切换到dual模式（域名+优选IP）");
         }
         
         // 如果IP列表为空或不足，尝试获取更多
@@ -554,16 +525,12 @@ export default {
           try {
             // 如果当前IP列表为空，重新获取
             if (ipList.length === 0) {
-              console.log("IP列表为空，重新获取...");
               ipList = await pickIpListByColo(colo, cfg);
-              console.log(`重新获取后IP列表: ${ipList.length}个IP`, ipList.slice(0, 3));
             }
             
             // 如果还是不足，尝试再次获取（可能获取到不同的IP）
             if (ipList.length < targetIPCount) {
-              console.log(`IP数量不足(${ipList.length}/${targetIPCount})，尝试获取更多...`);
               const moreIPs = await pickIpListByColo(colo, cfg);
-              console.log(`获取到额外${moreIPs.length}个IP`);
               
               // 去重并合并（处理对象格式的IP）
               const ipMap = new Map();
@@ -583,10 +550,9 @@ export default {
               });
               
               ipList = Array.from(ipMap.values()).slice(0, targetIPCount);
-              console.log(`合并后IP列表: ${ipList.length}个IP`);
             }
           } catch (e) {
-            console.error("获取更多优选IP失败:", e);
+            // 静默处理错误
           }
         } else if (ipList.length > targetIPCount) {
           // 如果超过10个，只取前10个
@@ -595,69 +561,27 @@ export default {
         
         // 如果仍然没有IP，使用静态IP列表作为后备
         if (ipList.length === 0) {
-          console.log("动态IP获取失败，使用静态IP列表作为后备");
           const staticIPs = pickIpListByColoStatic(colo);
           ipList = staticIPs;
-          console.log(`使用静态IP列表: ${ipList.length}个IP`, ipList);
         }
-        
-        // 统计HKG/TPE的数量
-        const hkgTpeCount = ipList.filter(item => {
-          const itemColo = typeof item === "string" ? "" : (item.colo || "");
-          return itemColo.toUpperCase() === "HKG" || itemColo.toUpperCase() === "TPE";
-        }).length;
-        
-        console.log(`最终IP列表: ${ipList.length}个IP（其中${hkgTpeCount}个为香港/台湾节点）`, 
-          ipList.slice(0, 3).map(item => {
-            const ip = typeof item === "string" ? item : item.ip;
-            const colo = typeof item === "string" ? "" : (item.colo || "");
-            return `${ip}(${getCountryNameByColo(colo)})`;
-          })
-        );
-        
-        if (ipList.length > 0) {
-          if (hkgTpeCount > 0) {
-            console.log(`✅ 已启用优选IP功能，自动切换到dual模式，包含1个原始域名节点 + ${ipList.length}个优选IP节点（${hkgTpeCount}个香港/台湾节点）`);
-          } else {
-            console.warn(`⚠️ 已启用优选IP功能，但未找到香港/台湾节点，包含${ipList.length}个其他地区优选IP节点`);
-          }
-        } else {
-          console.warn("⚠️ 警告：启用优选IP功能但未能获取到任何IP，订阅将只包含域名节点");
-        }
-      } else {
-        console.log("优选IP功能未启用，使用domain模式");
       }
 
       let ipOption = { mode: "domain", ips: [] };
       if (finalIpParam === "dual") {
         // dual模式：1个原始域名节点 + 多个优选IP节点
         ipOption = { mode: "dual", ips: ipList };
-        console.log(`设置ipOption为dual模式，IP数量: ${ipList.length}`, ipList.slice(0, 3));
       } else if (finalIpParam === "ip" || finalIpParam === "best" || finalIpParam === "colo") {
         // ip模式：仅优选IP节点（不包含原始域名）
         ipOption = { mode: "ip", ips: ipList };
-        console.log(`设置ipOption为ip模式，IP数量: ${ipList.length}`);
       } else {
         // domain模式：仅原始域名节点
         ipOption = { mode: "domain", ips: [] };
-        console.log(`设置ipOption为domain模式，不包含IP节点`);
       }
 
-      console.log(`开始生成订阅，ipOption:`, JSON.stringify({ mode: ipOption.mode, ipCount: ipOption.ips.length }));
       const str = generateV2raySub(cfg, ipOption);
-      console.log(`订阅生成完成，包含${str.split('\\n').filter(l => l.trim()).length}个节点`);
         
-        // 如果生成的订阅为空，记录日志并返回空字符串
+        // 如果生成的订阅为空，返回空字符串
         if (!str || str.trim().length === 0) {
-          console.error("Generated subscription is empty. Config:", {
-            uuid: cfg.uuid ? "***" : "missing",
-            workerHost: cfg.workerHost || "missing",
-            backendHost: cfg.backendHost || "missing",
-            backendPort: cfg.backendPort || "missing",
-            wsPath: cfg.wsPath || "missing",
-            mode: ipOption.mode,
-            ipCount: ipList.length
-          });
           return new Response("", {
             headers: { 
               "content-type": "text/plain; charset=utf-8",
@@ -671,7 +595,6 @@ export default {
         
         // 确保 Base64 编码结果不为空
         if (!b64 || b64.length === 0) {
-          console.error("Base64 encoding failed, original string length:", str.length);
           return new Response("", {
             headers: { 
               "content-type": "text/plain; charset=utf-8",
@@ -688,7 +611,6 @@ export default {
         });
       } catch (error) {
         // 捕获所有错误，避免 500 错误
-        console.error("Subscription generation error:", error);
         return new Response("", {
           headers: { 
             "content-type": "text/plain; charset=utf-8",
@@ -753,12 +675,8 @@ export default {
               wsPath: cfg?.wsPath || "/echws",
               mode: wsConfig.m || wsConfig.mode || cfg?.mode || "A"
             };
-            console.log("Config loaded from WebSocket path:", {
-              backendHost: cfg.backendHost,
-              backendPort: cfg.backendPort
-            });
           } catch (e) {
-            console.error("Failed to parse config from WebSocket path:", e, "path:", url.pathname);
+            // 静默处理错误
           }
         }
         
@@ -776,9 +694,8 @@ export default {
                 wsPath: wsConfig.wsPath || cfg?.wsPath || "/echws",
                 mode: wsConfig.mode || wsConfig.m || cfg?.mode || "A"
               };
-              console.log("Config loaded from WebSocket query parameter");
             } catch (e) {
-              console.error("Failed to parse config from query parameter:", e);
+              // 静默处理错误
             }
           }
         }
@@ -786,15 +703,6 @@ export default {
       
       // 验证配置是否完整
       if (!cfg || !cfg.backendHost || !cfg.backendPort) {
-        console.error("WebSocket: Config incomplete", {
-          hasUuid: !!cfg?.uuid,
-          hasWorkerHost: !!cfg?.workerHost,
-          hasBackendHost: !!cfg?.backendHost,
-          hasBackendPort: !!cfg?.backendPort,
-          urlPath: url.pathname,
-          urlSearch: url.search,
-          fullPath: url.pathname + url.search
-        });
         return new Response("Configuration incomplete", { status: 502 });
       }
       
@@ -1037,25 +945,6 @@ function renderAdminUI() {
     <p class="text-xs text-slate-500 mb-3 ml-6">
       只转发 WebSocket 数据，不主动修改请求头，兼容性最高。
     </p>
-    <label class="flex items-center mb-2">
-      <input type="radio" name="wsMode" value="B" class="mr-2">
-      <span>方式 B（高级混淆，可修改 Host / UA / SNI）</span>
-    </label>
-    <p class="text-xs text-slate-500 ml-6">
-      若启用方式 B，建议在下方填写 Fake Host / SNI / User-Agent，用于伪装成 CDN / 正常网站。
-    </p>
-  </div>
-
-  <!-- 混淆设置 -->
-  <div class="card mb-6">
-    <h2 class="text-xl font-semibold mb-4">混淆设置（可选）</h2>
-    <label class="label">Fake Host</label>
-    <input id="fakeHost" class="input" placeholder="例如：cdn.jsdelivr.net">
-    <label class="label">SNI</label>
-    <input id="sni" class="input" placeholder="例如：www.cloudflare.com">
-    <label class="label">User-Agent</label>
-    <input id="ua" class="input" placeholder="例如：Mozilla/5.0 Chrome/120">
-    <p class="text-xs text-slate-500">当 WS 模式选择为 B 时，这些字段将用于伪装请求头。</p>
   </div>
 
   <!-- 优选IP配置 -->
@@ -1158,6 +1047,8 @@ function renderAdminUI() {
         <div class="flex items-center gap-2">
           <input type="text" id="subUrlWithConfig" class="input flex-1" readonly placeholder="配置完成后点击下方按钮生成订阅链接">
           <button id="generateSubUrl" class="btn">生成订阅链接</button>
+          <button id="copySubUrl" class="btn" style="background: #3b82f6; color: white;">📋 复制链接</button>
+          <button id="clearSubUrl" class="btn-danger">清除</button>
         </div>
         <p class="text-xs text-slate-500 mt-1">⚠️ 重要：由于 v2rayN 不会携带浏览器 Cookie，请使用此链接（包含配置参数）添加到 v2rayN。</p>
       </div>
@@ -1184,9 +1075,6 @@ function renderAdminUI() {
       document.getElementById("wsPath").value = cfg.wsPath || "/echws";
       document.getElementById("backendHost").value = cfg.backendHost || "";
       document.getElementById("backendPort").value = cfg.backendPort || "2082";
-      document.getElementById("fakeHost").value = cfg.fakeHost || "";
-      document.getElementById("sni").value = cfg.sni || "";
-      document.getElementById("ua").value = cfg.ua || "";
 
       // 加载优选IP配置
       document.getElementById("enablePreferredIP").checked = cfg.enablePreferredIP || false;
@@ -1204,13 +1092,8 @@ function renderAdminUI() {
         preferredIPConfig.style.display = cfg.enablePreferredIP ? "block" : "none";
       }
 
-      if (cfg.mode === "B") {
-        var b = document.querySelector("input[name='wsMode'][value='B']");
-        if (b) b.checked = true;
-      } else {
-        var a = document.querySelector("input[name='wsMode'][value='A']");
-        if (a) a.checked = true;
-      }
+      var a = document.querySelector("input[name='wsMode'][value='A']");
+      if (a) a.checked = true;
 
       if (cfg.nodes && Array.isArray(cfg.nodes)) {
         cfg.nodes.forEach(function(n){ addNodeUI(n); });
@@ -1311,6 +1194,69 @@ function renderAdminUI() {
 
     document.getElementById("addNode").onclick = function(){ addNodeUI(); };
 
+    // 生成随机User-Agent函数（客户端版本）
+    function generateRandomUserAgent() {
+      // 浏览器类型和版本
+      const browsers = [
+        { name: 'Chrome', versions: ['120', '121', '122', '123', '124', '125', '126', '127', '128', '129'] },
+        { name: 'Chrome', versions: ['119', '120', '121', '122', '123', '124', '125', '126', '127'] },
+        { name: 'Firefox', versions: ['120', '121', '122', '123', '124', '125', '126', '127'] },
+        { name: 'Safari', versions: ['17.0', '17.1', '17.2', '17.3', '17.4', '17.5'] },
+        { name: 'Edge', versions: ['120', '121', '122', '123', '124', '125', '126', '127'] }
+      ];
+      
+      // 操作系统
+      const osList = [
+        { name: 'Windows NT 10.0; Win64; x64', webkit: '537.36' },
+        { name: 'Windows NT 10.0; WOW64', webkit: '537.36' },
+        { name: 'Macintosh; Intel Mac OS X 10_15_7', webkit: '605.1.15' },
+        { name: 'Macintosh; Intel Mac OS X 14_0_0', webkit: '605.1.15' },
+        { name: 'X11; Linux x86_64', webkit: '537.36' },
+        { name: 'X11; Ubuntu; Linux x86_64', webkit: '537.36' }
+      ];
+      
+      // 随机选择浏览器和操作系统
+      const browser = browsers[Math.floor(Math.random() * browsers.length)];
+      const browserVersion = browser.versions[Math.floor(Math.random() * browser.versions.length)];
+      const os = osList[Math.floor(Math.random() * osList.length)];
+      
+      // 生成唯一标识符（时间戳 + 随机数 + UUID片段 + 性能计数器）
+      const timestamp = Date.now();
+      const randomNum1 = Math.floor(Math.random() * 1000000);
+      const randomNum2 = Math.floor(Math.random() * 1000000);
+      const performanceCounter = typeof performance !== 'undefined' && performance.now ? Math.floor(performance.now() * 1000) : Math.floor(Math.random() * 1000000);
+      const uuidPart = crypto.randomUUID ? crypto.randomUUID().substring(0, 8).replace(/-/g, '') : Math.random().toString(36).substring(2, 10);
+      
+      // 构建唯一版本号（确保每次都不一样）
+      const buildNumber = String(randomNum1).padStart(6, '0').substring(0, 6);
+      const patchNumber = String(randomNum2).padStart(6, '0').substring(0, 6);
+      const revisionNumber = String(performanceCounter).padStart(6, '0').substring(0, 6);
+      
+      let userAgent;
+      
+      if (browser.name === 'Chrome') {
+        // Chrome 格式: Chrome/主版本.0.构建号.补丁号
+        userAgent = 'Mozilla/5.0 (' + os.name + ') AppleWebKit/' + os.webkit + ' (KHTML, like Gecko) Chrome/' + browserVersion + '.0.' + buildNumber + '.' + patchNumber + ' Safari/' + os.webkit;
+      } else if (browser.name === 'Firefox') {
+        // Firefox 格式: Firefox/主版本.0 (添加唯一构建ID)
+        const buildId = buildNumber + patchNumber.substring(0, 4);
+        userAgent = 'Mozilla/5.0 (' + os.name + '; rv:' + browserVersion + '.0) Gecko/20100101 Firefox/' + browserVersion + '.0.' + buildId;
+      } else if (browser.name === 'Safari') {
+        // Safari 格式: Version/主版本 (添加唯一构建号)
+        const safariBuild = browserVersion + '.' + buildNumber.substring(0, 3) + '.' + patchNumber.substring(0, 3);
+        userAgent = 'Mozilla/5.0 (' + os.name + ') AppleWebKit/' + os.webkit + ' (KHTML, like Gecko) Version/' + safariBuild + ' Safari/' + os.webkit;
+      } else if (browser.name === 'Edge') {
+        // Edge 格式: Edg/主版本.0.构建号.补丁号
+        userAgent = 'Mozilla/5.0 (' + os.name + ') AppleWebKit/' + os.webkit + ' (KHTML, like Gecko) Chrome/' + browserVersion + '.0.0.0 Safari/' + os.webkit + ' Edg/' + browserVersion + '.0.' + buildNumber + '.' + patchNumber;
+      } else {
+        // 默认 Chrome
+        userAgent = 'Mozilla/5.0 (' + os.name + ') AppleWebKit/' + os.webkit + ' (KHTML, like Gecko) Chrome/' + browserVersion + '.0.' + buildNumber + '.' + patchNumber + ' Safari/' + os.webkit;
+      }
+      
+      // 返回唯一的 User-Agent（通过时间戳、随机数、UUID片段和性能计数器的组合确保唯一性）
+      return userAgent;
+    }
+
     // 优选IP功能开关事件
     document.getElementById("enablePreferredIP").onchange = function() {
       var preferredIPConfig = document.getElementById("preferredIPConfig");
@@ -1320,17 +1266,13 @@ function renderAdminUI() {
     };
 
     document.getElementById("save").onclick = async function () {
-      var modeInput = document.querySelector("input[name='wsMode']:checked");
-      var mode = modeInput ? modeInput.value : "A";
+      var mode = "A";
 
       var uuidEl = document.getElementById("uuid");
       var workerHostEl = document.getElementById("workerHost");
       var backendHostEl = document.getElementById("backendHost");
       var backendPortEl = document.getElementById("backendPort");
       var wsPathEl = document.getElementById("wsPath");
-      var fakeHostEl = document.getElementById("fakeHost");
-      var sniEl = document.getElementById("sni");
-      var uaEl = document.getElementById("ua");
 
       if (!uuidEl.value) return showMsg("❌ UUID 不能为空", true);
       if (!workerHostEl.value) return showMsg("❌ Worker 域名不能为空", true);
@@ -1362,9 +1304,6 @@ function renderAdminUI() {
         wsPath: wsPathEl.value,
         backendHost: backendHostEl.value,
         backendPort: backendPortEl.value,
-        fakeHost: fakeHostEl.value,
-        sni: sniEl.value,
-        ua: uaEl.value,
         mode: mode,
         nodes: nodesData,
         enablePreferredIP: enablePreferredIP,
@@ -1383,6 +1322,8 @@ function renderAdminUI() {
       });
 
       showMsg("✅ 已保存配置到 Cookie");
+      // 自动更新订阅链接
+      generateSubscriptionUrl();
     };
 
     document.getElementById("resetCfg").onclick = async function () {
@@ -1405,11 +1346,7 @@ function renderAdminUI() {
       var backendHostEl = document.getElementById("backendHost");
       var backendPortEl = document.getElementById("backendPort");
       var wsPathEl = document.getElementById("wsPath");
-      var fakeHostEl = document.getElementById("fakeHost");
-      var sniEl = document.getElementById("sni");
-      var uaEl = document.getElementById("ua");
-      var modeInput = document.querySelector("input[name='wsMode']:checked");
-      var mode = modeInput ? modeInput.value : "A";
+      var mode = "A";
 
       // 验证必填字段
       if (!uuidEl.value || !workerHostEl.value || !backendHostEl.value || !backendPortEl.value) {
@@ -1437,9 +1374,6 @@ function renderAdminUI() {
         wsPath: wsPathEl.value.trim() || "/echws",
         backendHost: backendHostEl.value.trim(),
         backendPort: backendPortEl.value.trim(),
-        fakeHost: fakeHostEl.value.trim(),
-        sni: sniEl.value.trim(),
-        ua: uaEl.value.trim(),
         mode: mode,
         nodes: nodesData
       };
@@ -1464,6 +1398,59 @@ function renderAdminUI() {
       };
     }
 
+    // 绑定清除按钮
+    var clearBtn = document.getElementById("clearSubUrl");
+    if (clearBtn) {
+      clearBtn.onclick = function() {
+        document.getElementById("subUrlWithConfig").value = "";
+      };
+    }
+
+    // 绑定复制订阅链接按钮
+    var copyBtn = document.getElementById("copySubUrl");
+    if (copyBtn) {
+      copyBtn.onclick = async function() {
+        var subUrlInput = document.getElementById("subUrlWithConfig");
+        var subUrl = subUrlInput.value.trim();
+        
+        if (!subUrl) {
+          alert("请先生成订阅链接！");
+          return;
+        }
+        
+        try {
+          // 使用现代 Clipboard API
+          await navigator.clipboard.writeText(subUrl);
+          
+          // 显示成功提示
+          var originalText = copyBtn.textContent;
+          copyBtn.textContent = "✓ 已复制";
+          copyBtn.style.background = "#10b981";
+          
+          setTimeout(function() {
+            copyBtn.textContent = originalText;
+            copyBtn.style.background = "#3b82f6";
+          }, 2000);
+        } catch (err) {
+          // 降级方案：使用传统方法
+          subUrlInput.select();
+          subUrlInput.setSelectionRange(0, 99999); // 移动端兼容
+          try {
+            document.execCommand("copy");
+            var originalText = copyBtn.textContent;
+            copyBtn.textContent = "✓ 已复制";
+            copyBtn.style.background = "#10b981";
+            setTimeout(function() {
+              copyBtn.textContent = originalText;
+              copyBtn.style.background = "#3b82f6";
+            }, 2000);
+          } catch (fallbackErr) {
+            alert("复制失败，请手动选择并复制链接");
+          }
+        }
+      };
+    }
+
     loadConfig();
   <\/script>
 </body>
@@ -1482,14 +1469,9 @@ async function loadConfig(request, url, sessionSecret) {
   if (cookies["vless_config"]) {
     try {
       raw = await decrypt(cookies["vless_config"], sessionSecret);
-      if (raw) {
-        console.log("Config loaded from cookie, length:", raw.length);
-      }
     } catch (e) {
-      console.error("Failed to decrypt config cookie:", e);
+      // 静默处理错误
     }
-  } else {
-    console.log("No vless_config cookie found. Available cookies:", Object.keys(cookies));
   }
   
   // If not in cookie, try URL parameter
@@ -1498,24 +1480,19 @@ async function loadConfig(request, url, sessionSecret) {
     if (cfgParam) {
       try {
         raw = decodeURIComponent(cfgParam);
-        console.log("Config loaded from URL parameter, length:", raw.length);
       } catch (e) {
-        console.error("Failed to decode config from URL parameter:", e);
+        // 静默处理错误
       }
     }
   }
   
   if (!raw) {
-    console.log("No config found, returning default empty config");
     return {
       uuid: "",
       workerHost: "",
       wsPath: "/echws",
       backendHost: "",
       backendPort: "2082",
-      fakeHost: "",
-      sni: "",
-      ua: "",
       mode: "A",
       nodes: [],
       enablePreferredIP: false,
@@ -1531,24 +1508,14 @@ async function loadConfig(request, url, sessionSecret) {
   
   try {
     const config = JSON.parse(raw);
-    console.log("Config parsed successfully:", {
-      hasUuid: !!config.uuid,
-      hasWorkerHost: !!config.workerHost,
-      hasBackendHost: !!config.backendHost,
-      hasBackendPort: !!config.backendPort
-    });
     return config;
   } catch (e) {
-    console.error("Failed to parse config JSON:", e);
     return {
       uuid: "",
       workerHost: "",
       wsPath: "/echws",
       backendHost: "",
       backendPort: "2082",
-      fakeHost: "",
-      sni: "",
-      ua: "",
       mode: "A",
       nodes: [],
       enablePreferredIP: false,
@@ -1620,8 +1587,8 @@ function buildVlessUrl(cfg, hostOverride = null, name = "Node") {
     params.set("security", "tls");
     params.set("type", "ws");
     params.set("path", wsPathWithConfig);
-    params.set("host", cfg.fakeHost || workerHost);
-    params.set("sni", cfg.sni || workerHost);
+    params.set("host", workerHost);
+    params.set("sni", workerHost);
     
     // 构建 VLESS URL
     const url = `vless://${uuid}@${host.trim()}:443?${params.toString()}#${encodeURIComponent(name || "Node")}`;
@@ -1633,7 +1600,6 @@ function buildVlessUrl(cfg, hostOverride = null, name = "Node") {
     
     return url;
   } catch (e) {
-    console.error("buildVlessUrl error:", e);
     return null;
   }
 }
@@ -1678,9 +1644,6 @@ function generateV2raySub(cfg, ipOption) {
     const maxIPs = 10;
     const ipListToUse = ips.slice(0, maxIPs);
     
-    console.log(`生成优选IP节点，模式: ${mode}, IP数量: ${ipListToUse.length}`, ipListToUse.slice(0, 3));
-    
-    let successCount = 0;
     ipListToUse.forEach(function(ipItem, idx) {
       // 处理IP可能是字符串或对象的情况
       let ip = "";
@@ -1692,12 +1655,10 @@ function generateV2raySub(cfg, ipOption) {
         ip = ipItem.ip.trim();
         colo = ipItem.colo || "";
       } else {
-        console.warn(`跳过无效IP[${idx}]:`, ipItem);
         return;
       }
       
       if (!ip || ip.length === 0) {
-        console.warn(`跳过空IP[${idx}]:`, ipItem);
         return;
       }
       
@@ -1714,35 +1675,12 @@ function generateV2raySub(cfg, ipOption) {
       const ipUrl = buildVlessUrl(cfg, ip, name);
       if (ipUrl && ipUrl.trim().length > 0) {
         list.push(ipUrl);
-        successCount++;
-      } else {
-        console.error(`生成IP节点URL失败[${idx}]:`, ip, name);
       }
     });
-    
-    console.log(`成功生成${successCount}个优选IP节点URL`);
-    
-    // 如果IP数量不足10个，记录日志
-    if (ipListToUse.length < maxIPs && mode === "dual") {
-      console.log(`优选IP节点数量：${successCount}/${maxIPs}，已包含1个原始域名节点`);
-    }
-  } else if ((mode === "dual" || mode === "ip") && ips.length === 0) {
-    console.warn(`警告：模式为${mode}但IP列表为空，将只包含域名节点`);
   }
 
   // 过滤掉空字符串和无效 URL
   const validList = list.filter(url => url && url.trim().length > 0 && url.startsWith("vless://"));
-  
-  console.log(`generateV2raySub完成，总节点数: ${validList.length}`, {
-    mode: mode,
-    ipCount: ips.length,
-    domainNodes: !ipOnly ? 1 : 0,
-    ipNodes: (mode === "dual" || mode === "ip") ? validList.length - (!ipOnly ? 1 : 0) : 0
-  });
-  
-  if (validList.length === 0) {
-    console.error("警告：生成的订阅列表为空！");
-  }
   
   return validList.join("\n");
 }
@@ -1755,6 +1693,71 @@ function generateV2raySub(cfg, ipOption) {
 const defaultIPURL = 'https://raw.githubusercontent.com/qwer-search/bestip/refs/heads/main/kejilandbestip.txt';
 const wetestV4URL = "https://www.wetest.vip/page/cloudflare/address_v4.html";
 const wetestV6URL = "https://www.wetest.vip/page/cloudflare/address_v6.html";
+
+// ===============================================================
+// 随机生成 User-Agent（确保每次生成都独一无二）
+// ===============================================================
+function generateRandomUserAgent() {
+  // 浏览器类型和版本
+  const browsers = [
+    { name: 'Chrome', versions: ['120', '121', '122', '123', '124', '125', '126', '127', '128', '129'] },
+    { name: 'Chrome', versions: ['119', '120', '121', '122', '123', '124', '125', '126', '127'] },
+    { name: 'Firefox', versions: ['120', '121', '122', '123', '124', '125', '126', '127'] },
+    { name: 'Safari', versions: ['17.0', '17.1', '17.2', '17.3', '17.4', '17.5'] },
+    { name: 'Edge', versions: ['120', '121', '122', '123', '124', '125', '126', '127'] }
+  ];
+  
+  // 操作系统
+  const osList = [
+    { name: 'Windows NT 10.0; Win64; x64', webkit: '537.36' },
+    { name: 'Windows NT 10.0; WOW64', webkit: '537.36' },
+    { name: 'Macintosh; Intel Mac OS X 10_15_7', webkit: '605.1.15' },
+    { name: 'Macintosh; Intel Mac OS X 14_0_0', webkit: '605.1.15' },
+    { name: 'X11; Linux x86_64', webkit: '537.36' },
+    { name: 'X11; Ubuntu; Linux x86_64', webkit: '537.36' }
+  ];
+  
+  // 随机选择浏览器和操作系统
+  const browser = browsers[Math.floor(Math.random() * browsers.length)];
+  const browserVersion = browser.versions[Math.floor(Math.random() * browser.versions.length)];
+  const os = osList[Math.floor(Math.random() * osList.length)];
+  
+  // 生成唯一标识符（时间戳 + 随机数 + UUID片段 + 性能计数器）
+  const timestamp = Date.now();
+  const randomNum1 = Math.floor(Math.random() * 1000000);
+  const randomNum2 = Math.floor(Math.random() * 1000000);
+  const performanceCounter = typeof performance !== 'undefined' && performance.now ? Math.floor(performance.now() * 1000) : Math.floor(Math.random() * 1000000);
+  const uuidPart = crypto.randomUUID ? crypto.randomUUID().substring(0, 8).replace(/-/g, '') : Math.random().toString(36).substring(2, 10);
+  
+  // 构建唯一版本号（确保每次都不一样）
+  const buildNumber = String(randomNum1).padStart(6, '0').substring(0, 6);
+  const patchNumber = String(randomNum2).padStart(6, '0').substring(0, 6);
+  const revisionNumber = String(performanceCounter).padStart(6, '0').substring(0, 6);
+  
+  let userAgent;
+  
+  if (browser.name === 'Chrome') {
+    // Chrome 格式: Chrome/主版本.0.构建号.补丁号
+    userAgent = `Mozilla/5.0 (${os.name}) AppleWebKit/${os.webkit} (KHTML, like Gecko) Chrome/${browserVersion}.0.${buildNumber}.${patchNumber} Safari/${os.webkit}`;
+  } else if (browser.name === 'Firefox') {
+    // Firefox 格式: Firefox/主版本.0 (添加唯一构建ID)
+    const buildId = `${buildNumber}${patchNumber.substring(0, 4)}`;
+    userAgent = `Mozilla/5.0 (${os.name}; rv:${browserVersion}.0) Gecko/20100101 Firefox/${browserVersion}.0.${buildId}`;
+  } else if (browser.name === 'Safari') {
+    // Safari 格式: Version/主版本 (添加唯一构建号)
+    const safariBuild = `${browserVersion}.${buildNumber.substring(0, 3)}.${patchNumber.substring(0, 3)}`;
+    userAgent = `Mozilla/5.0 (${os.name}) AppleWebKit/${os.webkit} (KHTML, like Gecko) Version/${safariBuild} Safari/${os.webkit}`;
+  } else if (browser.name === 'Edge') {
+    // Edge 格式: Edg/主版本.0.构建号.补丁号
+    userAgent = `Mozilla/5.0 (${os.name}) AppleWebKit/${os.webkit} (KHTML, like Gecko) Chrome/${browserVersion}.0.0.0 Safari/${os.webkit} Edg/${browserVersion}.0.${buildNumber}.${patchNumber}`;
+  } else {
+    // 默认 Chrome
+    userAgent = `Mozilla/5.0 (${os.name}) AppleWebKit/${os.webkit} (KHTML, like Gecko) Chrome/${browserVersion}.0.${buildNumber}.${patchNumber} Safari/${os.webkit}`;
+  }
+  
+  // 返回唯一的 User-Agent（通过时间戳、随机数、UUID片段和性能计数器的组合确保唯一性）
+  return userAgent;
+}
 
 // Cloudflare colo代码到国家/地区的中文映射
 function getCountryNameByColo(colo) {
@@ -1829,7 +1832,7 @@ function getCountryNameByColo(colo) {
 // 解析wetest页面获取IP列表
 async function fetchAndParseWetest(url) {
   try {
-    const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const response = await fetch(url, { headers: { 'User-Agent': generateRandomUserAgent() } });
     if (!response.ok) return [];
     const html = await response.text();
     const results = [];
@@ -1928,7 +1931,7 @@ async function fetchPreferredIPsFromURL(yxURL, ipv4Enabled = true, ipv6Enabled =
   }
   
   try {
-    const response = await fetch(yxURL, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const response = await fetch(yxURL, { headers: { 'User-Agent': generateRandomUserAgent() } });
     if (!response.ok) return [];
     
     const contentType = response.headers.get('content-type') || '';
@@ -1999,7 +2002,6 @@ async function fetchPreferredIPsFromURL(yxURL, ipv4Enabled = true, ipv6Enabled =
     
     return results;
   } catch (error) {
-    console.error('从自定义URL获取优选IP失败:', error);
     return [];
   }
 }
@@ -2074,11 +2076,9 @@ async function pickIpListByColo(colo, cfg = null) {
           if (hkgTpeIPs.length > 0) {
             // 优先使用所有可用的HKG/TPE IP，即使不足10个
             selectedIPs = hkgTpeIPs;
-            console.log(`✅ 找到${hkgTpeIPs.length}个香港/台湾IP节点，将全部使用`);
             
             // 如果HKG/TPE的IP不足10个，尝试从静态列表补充
             if (selectedIPs.length < targetIPCount) {
-              console.log(`香港/台湾IP数量不足(${selectedIPs.length}/${targetIPCount})，从静态列表补充...`);
               const staticIPs = pickIpListByColoStatic(colo);
               // 只补充HKG/TPE的静态IP
               const staticHkgTpe = staticIPs.filter(item => {
@@ -2089,12 +2089,10 @@ async function pickIpListByColo(colo, cfg = null) {
               
               if (staticHkgTpe.length > 0) {
                 selectedIPs = [...selectedIPs, ...staticHkgTpe];
-                console.log(`从静态列表补充了${staticHkgTpe.length}个香港/台湾IP`);
               }
             }
           } else {
             // 如果没有找到HKG/TPE的IP，使用静态列表
-            console.log("⚠️ 未找到香港/台湾IP，使用静态IP列表");
             const staticIPs = pickIpListByColoStatic(colo);
             selectedIPs = staticIPs.filter(item => {
               const itemColo = (item.colo || "").toUpperCase();
@@ -2103,7 +2101,6 @@ async function pickIpListByColo(colo, cfg = null) {
             
             if (selectedIPs.length === 0) {
               // 如果静态列表也没有HKG/TPE，使用所有静态IP（至少保证有IP可用）
-              console.log("⚠️ 静态列表也没有香港/台湾IP，使用所有静态IP");
               selectedIPs = staticIPs;
             }
           }
@@ -2137,14 +2134,6 @@ async function pickIpListByColo(colo, cfg = null) {
         }
         
         if (uniqueIPs.length > 0) {
-          // 统计HKG/TPE的数量
-          const hkgTpeCount = uniqueIPs.filter(item => {
-            const itemColo = (item.colo || "").toUpperCase();
-            return itemColo === "HKG" || itemColo === "TPE";
-          }).length;
-          
-          console.log(`最终选择${uniqueIPs.length}个IP节点，其中${hkgTpeCount}个为香港/台湾节点`);
-          
           // 返回包含IP和colo信息的对象数组
           return uniqueIPs.map(item => ({
             ip: item.ip,
@@ -2153,7 +2142,7 @@ async function pickIpListByColo(colo, cfg = null) {
         }
       }
     } catch (e) {
-      console.error('获取动态优选IP失败，使用静态IP列表:', e);
+      // 静默处理错误，使用静态IP列表
     }
   }
   
@@ -2355,7 +2344,7 @@ function renderHealthPage(health, request = null) {
       </div>
       <div class="info-row">
         <span class="info-label">代理模式</span>
-        <span class="info-value">${health.config.mode === "A" ? "方式 A（稳定型）" : "方式 B（高级混淆）"}</span>
+        <span class="info-value">方式 A（稳定型）</span>
       </div>
       <div class="info-row">
         <span class="info-label">配置完整性</span>
@@ -2654,13 +2643,13 @@ function generateSingbox(cfg) {
     uuid: cfg.uuid,
     tls: {
       enabled: true,
-      server_name: cfg.sni || cfg.workerHost
+      server_name: cfg.workerHost
     },
     transport: {
       type: "ws",
       path: cfg.wsPath,
       headers: {
-        Host: cfg.fakeHost || cfg.workerHost
+        Host: cfg.workerHost
       }
     }
   });
@@ -2676,13 +2665,13 @@ function generateSingbox(cfg) {
         uuid: cfg.uuid,
         tls: {
           enabled: true,
-          server_name: cfg.sni || n.host
+          server_name: n.host
         },
         transport: {
           type: "ws",
           path: cfg.wsPath,
           headers: {
-            Host: cfg.fakeHost || n.host
+            Host: n.host
           }
         }
       });
@@ -2706,12 +2695,12 @@ function generateClash(cfg) {
       port: 443,
       uuid: cfg.uuid,
       tls: true,
-      servername: cfg.sni || host,
+      servername: host,
       network: "ws",
       ws_opts: {
         path: cfg.wsPath,
         headers: {
-          Host: cfg.fakeHost || host
+          Host: host
         }
       }
     });
@@ -2759,12 +2748,9 @@ async function generateQRCode(cfg) {
 }
 
 // ===============================================================
-// WebSocket Proxy (Mode A & B)
+// WebSocket Proxy (Mode A)
 // ===============================================================
 async function handleWS(request, cfg) {
-  if (cfg.mode === "B") {
-    return handleWS_B(request, cfg);
-  }
   return handleWS_A(request, cfg);
 }
 
@@ -2807,93 +2793,12 @@ async function handleWS_A(request, cfg) {
   let resp;
   try {
     resp = await fetch(backendReq);
-    console.log("WebSocket Mode A: Backend response status:", resp.status);
   } catch (e) {
-    console.error("WebSocket Mode A: Backend connection failed:", e.message);
     return new Response("Backend connection failed: " + e.message, { status: 502 });
   }
 
   if (resp.status !== 101) {
     const errorText = await resp.text().catch(() => "Unknown error");
-    console.error("WebSocket Mode A: Upgrade failed, status:", resp.status, "response:", errorText.substring(0, 200));
-    return new Response(`WebSocket upgrade failed: ${resp.status} - ${errorText.substring(0, 100)}`, { status: 502 });
-  }
-  return resp;
-}
-
-// --- Mode B: Obfuscated ---
-async function handleWS_B(request, cfg) {
-  // 从 URL 中提取原始路径
-  const urlPath = new URL(request.url).pathname;
-  // 提取实际的 WebSocket 路径（去除配置部分）
-  // 路径格式可能是：/echws/{config} 或 /echws
-  let wsPath = cfg.wsPath || "/echws";
-  if (urlPath.startsWith("/echws")) {
-    // 如果路径是 /echws/{config}，提取基础路径
-    const pathParts = urlPath.split('/').filter(p => p);
-    if (pathParts[0] === 'echws') {
-      wsPath = "/echws";  // 使用基础路径
-    }
-  }
-  
-  const backendUrl = `http://${cfg.backendHost}:${cfg.backendPort}${wsPath}`;
-  
-  // 创建新的 headers
-  const headers = new Headers();
-  
-  // 保留 WebSocket 升级相关的 headers
-  const upgradeHeader = request.headers.get("Upgrade");
-  const connectionHeader = request.headers.get("Connection");
-  const secWebSocketKey = request.headers.get("Sec-WebSocket-Key");
-  const secWebSocketVersion = request.headers.get("Sec-WebSocket-Version");
-  const secWebSocketProtocol = request.headers.get("Sec-WebSocket-Protocol");
-  const secWebSocketExtensions = request.headers.get("Sec-WebSocket-Extensions");
-  
-  if (upgradeHeader) headers.set("Upgrade", upgradeHeader);
-  if (connectionHeader) headers.set("Connection", connectionHeader);
-  if (secWebSocketKey) headers.set("Sec-WebSocket-Key", secWebSocketKey);
-  if (secWebSocketVersion) headers.set("Sec-WebSocket-Version", secWebSocketVersion);
-  if (secWebSocketProtocol) headers.set("Sec-WebSocket-Protocol", secWebSocketProtocol);
-  if (secWebSocketExtensions) headers.set("Sec-WebSocket-Extensions", secWebSocketExtensions);
-
-  // 混淆设置
-  if (cfg.fakeHost) {
-    headers.set("Host", cfg.fakeHost);
-  } else {
-    headers.set("Host", cfg.backendHost);
-  }
-  if (cfg.ua) {
-    headers.set("User-Agent", cfg.ua);
-  }
-  if (cfg.sni) {
-    headers.set("CF-Connecting-SNI", cfg.sni);
-  }
-
-  headers.set("X-Forwarded-For", "1.1.1.1");
-  headers.set("X-Real-IP", "1.1.1.1");
-  
-  // 保留 Origin（如果需要）
-  const origin = request.headers.get("Origin");
-  if (origin) headers.set("Origin", origin);
-
-  const backendReq = new Request(backendUrl, {
-    method: request.method,
-    headers,
-    body: request.body
-  });
-
-  let resp;
-  try {
-    resp = await fetch(backendReq);
-    console.log("WebSocket Mode B: Backend response status:", resp.status);
-  } catch (e) {
-    console.error("WebSocket Mode B: Backend connection failed:", e.message);
-    return new Response("Backend connection failed: " + e.message, { status: 503 });
-  }
-
-  if (resp.status !== 101) {
-    const errorText = await resp.text().catch(() => "Unknown error");
-    console.error("WebSocket Mode B: Upgrade failed, status:", resp.status, "response:", errorText.substring(0, 200));
     return new Response(`WebSocket upgrade failed: ${resp.status} - ${errorText.substring(0, 100)}`, { status: 502 });
   }
   return resp;
